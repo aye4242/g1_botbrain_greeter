@@ -10,7 +10,9 @@ run_log/
 report/
 *.pdf
 *.gv
-.spec-workflow
+.spec-workflow/
+.codex
+
 # 环境变量
 .env
 
