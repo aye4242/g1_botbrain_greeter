@@ -1,0 +1,12 @@
+robot_configuration:
+  robot_name: "g1_robot"
+  robot_model: "g1"
+  description_file_type: "xacro"
+  network_interface: "eth0"
+  tita_namespace: ""
+  openai_api_key: ""
+  wifi_interface: "wlan0"
+  wifi_ssid: "HUAWEI-AX6"
+  wifi_password: "huawei7n"
+  default_map: "" 
+  default_static_map: "office1.yaml"

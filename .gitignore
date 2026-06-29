@@ -1,0 +1,23 @@
+# 编译产物
+botbrain_ws/build/
+botbrain_ws/install/
+botbrain_ws/log/
+botbrain_ws/detect_img/
+
+# 运行时日志/数据
+log/
+run_log/
+report/
+*.pdf
+*.gv
+
+# 环境变量
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统文件
+.DS_Store
