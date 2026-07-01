@@ -206,6 +206,40 @@ default_grid_yaml = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'accumu
 # 保存后需要重新编译
 ```
 
+**多场景/多楼层地图管理**
+
+每套地图由三个文件组成，命名规范：`<场景名>_scans.pcd` + `<场景名>.yaml` + `<场景名>.pgm`
+
+```bash
+# 步骤1：建图前在 mid360.yaml 里指定点云保存路径（需 pcd_save_en: true）
+map_file_path: "/botbrain_ws/src/g1_pkg/maps/floor1_scans.pcd"
+
+# 步骤2：建图结束后保存栅格图，-f 后面的名字就是地图名
+docker exec -it g1_robot_fast_lio bash
+source install/setup.bash
+ros2 run nav2_map_server map_saver_cli \
+     -t /accumulated_grid \
+     --free 0.196 --occ 0.65 \
+     -f /botbrain_ws/src/g1_pkg/maps/floor1
+# 生成 floor1.yaml + floor1.pgm
+
+# 步骤3：保存点云（路径由上面 mid360.yaml 指定）
+kill -SIGINT $(pgrep fastlio_mapping)
+# 生成 floor1_scans.pcd
+# 地图保存后将 yaml 文件建图保存功能关闭(pcd_save_en: false)，并重新编译
+```
+
+```bash
+# 切换地图方法一：改 localization_3d.launch.py 默认值后重新编译
+default_pcd_path  = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'floor1_scans.pcd')
+default_grid_yaml = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'floor1.yaml')
+
+# 切换地图方法二：启动时传参，无需重新编译（推荐）
+docker compose exec localization bash -c \
+  "source install/setup.bash && ros2 launch g1_pkg localization_3d.launch.py \
+   map_file:=/botbrain_ws/src/g1_pkg/maps/floor1_scans.pcd"
+```
+
 **启动建图定位服务**
 
 ```bash
@@ -221,17 +255,16 @@ docker compose up fast_lio localization
 # 当localization的日志参数reg_result.fitness大于0.9即完成ICP匹配
 ```
 
-**启动导航服务(想要开导航就需要开启建图定位)**
-
 ```bash
 cd ~/botbrain_ws/botbrain_project-main/
 # 终端3 启动导航服务
 docker compose up navigation
 # 可以从可视化页面发送/g1_robot/goal_pose 话题开始导航
 
-# 记录目标点位
+# 记录目标点位(以下的命令都需要进行进入容器和source)
 docker exec -it g1_robot_bringup bash
 source install/setup.bash
+
 ros2 run bot_navigation waypoint_recorder.py record office
 # 目标点位信息会记录到 src/bot_navigation/nav_waypoints.yaml 文件里
 # 查看已经存在的点位
@@ -249,6 +282,85 @@ ros2 run bot_navigation waypoint_navigator.py office1 office2 office3 turn offic
 #foxglove话题配置文件
 /home/unitree/botbrain_ws/botbrain_project-main/botbrain_ws/src/bot_bringup/config/foxglove_bridge_params.yaml
 ```
+> ⚠️ **服务启动延迟说明（勿在日志未就绪前判断失败）**
+>
+> | 服务 | 延迟 | 就绪标志（看日志确认） |
+> |------|------|----------------------|
+> | `bringup`（含雷达驱动） | 无延迟，但雷达硬件握手需 **5~10s** | `livox/lidar publish use livox custom format` |
+> | `fast_lio` | **sleep 15s** 后启动 | `[MAP] frame=X feats_down=XX` |
+> | `localization` | **sleep 30s** 后启动 | `reg_result.fitness > 0.9` |
+> | `navigation` | **sleep 30s** 后启动 | Nav2 lifecycle 节点全部 active |
+>
+> **常见误判**：bringup 刚起来时雷达驱动还在握手，fast_lio 会打印 `No Effective Points!`，**属正常现象**，等雷达就绪后会自动恢复。若超过 30s 仍然 `No Effective Points`，再排查雷达连接。
+>
+> 查看各服务就绪状态：
+> ```bash
+> # 确认雷达驱动就绪
+> docker compose logs bringup | grep "livox custom format"
+> # 确认定位收敛
+> docker compose logs -f localization | grep fitness
+> ```
+
+> **启动就绪检查顺序（必须按序，否则必飘）**
+> 1. ✅ bringup 日志出现 `livox custom format` → 雷达就绪
+> 2. ✅ fast_lio 日志出现 `[MAP] frame=X` → 里程计就绪（`No Effective Points` 消失）
+> 3. ⚠️ `target size: 0` **不会自动恢复** → 必须在 Foxglove 发送 `/initialpose` 手动指定机器人在地图上的位置
+> 4. ✅ localization 日志出现 `fitness > 0.9` → ICP 收敛，定位可信
+> 5. ✅ 再启动 navigation，再移动机器人
+>
+> `current_mode request still pending` 是底盘 DDS 初始化中的正常现象，无需处理。
+
+**启动导航服务(想要开导航就需要开启建图定位)**
+### 代码更新与重编译
+
+#### 是否需要重新编译？
+
+> 源码通过 volume 挂载到容器（`./botbrain_ws/:/botbrain_ws`），
+> 主机上修改文件后容器里立即可见，**Python / 配置类改完重启服务就行**。
+
+| 修改的文件类型 | 需要重编译 | 操作 |
+|---|:---:|---|
+| Python 脚本 (`.py`) | ❌ | 重启对应服务 |
+| Launch 文件 (`.launch.py`) | ❌ | 重启对应服务 |
+| 配置文件 (`.yaml` / `.json`) | ❌ | 重启对应服务 |
+| 地图文件 (`.pcd` / `.pgm`) | ❌ | 重启对应服务 |
+| C++ 源码 (`.cpp` / `.hpp`) | ✅ | 先编译再重启 |
+| `CMakeLists.txt` / `package.xml` | ✅ | 先编译再重启 |
+
+#### 重启服务（无需编译时）
+
+```bash
+cd ~/botbrain_ws/botbrain_project-main/
+# 重启指定服务（如只改了导航的 py 脚本）
+docker compose restart navigation
+# 重启多个服务
+docker compose restart bringup state_machine
+# 停止再重启（比 restart 更彻底，确保配置重新加载）
+docker compose stop navigation && docker compose up navigation
+```
+
+#### 重新编译（C++ 代码或 CMakeLists 变更时）
+
+```bash
+cd ~/botbrain_ws/botbrain_project-main/
+# 编译所有包（约 3~10 分钟）
+docker compose up builder_base
+# 看到 exited with code 0 说明编译成功，再重启受影响的服务
+docker compose restart fast_lio localization
+```
+
+> 服务 → 源码包 → 操作对照
+
+| 服务名 | 主要源码包 | 语言 | 改动后操作 |
+|---|---|---|---|
+| `bringup` | `bot_bringup`, `g1_pkg` | Python + 配置 | `docker compose restart bringup` |
+| `fast_lio` | `fast_lio` | C++ | 编译后 `restart fast_lio` |
+| `localization` | `open3d_loc` | C++ | 编译后 `restart localization` |
+| `navigation` | `bot_navigation`, `g1_pkg` | Python | `docker compose restart navigation` |
+| `state_machine` | `bot_state_machine` | Python | `docker compose restart state_machine` |
+| `yolo` | `bot_yolo` | Python + C++ | `docker compose up builder_yolo` 后 restart |
+
+---
 
 ## 集成思路
 
