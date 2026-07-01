@@ -8,9 +8,9 @@
       use_astar: true
       motion_model_for_search: "VON_NEUMANN"
       downsample_costmap: false
-      tolerance: 0.1
+      tolerance: 0.3          # 0.1→0.3: 允许在距目标0.3m内的空闲格停下，绕开膨胀圈
       max_iterations: 500000
-      cost_travel_multiplier: 20.0
+      cost_travel_multiplier: 15.0   # 20.0→15.0: 降低高代价区域惩罚，避免迭代耗尽
 
 
 /**/controller_server:
@@ -179,7 +179,7 @@
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.4
+        inflation_radius: 0.3      # 0.4→0.25: G1是双足机器人，比轮式更窄，0.4会封锁靠墙的目标点
         cost_scaling_factor: 5.0
 
 /**/local_costmap:
