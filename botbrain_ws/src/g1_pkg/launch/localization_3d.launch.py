@@ -43,14 +43,14 @@ def generate_launch_description():
                 'voxelsize_fine':           0.2,    # 走廊环境大体素=大收敛盆地，防止跳局部最优
                 'threshold_fitness':        0.5,   # 0.7→0.5: 允许断流恢复时接受中等质量匹配；级联靠 dis_updatemap=5.0 防护
                 'threshold_fitness_init':   0.5,
-                'loc_frequence':            2.5,
+                'loc_frequence':            4.0,    # 2.5→4.0: 提高ICP修正频率，减少漂移累积
                 'save_scan':                False,
                 'maxpoints_source':         80000,
                 'maxpoints_target':         400000,
                 'initialpose':              [0.0, 0.0, IMU_HEIGHT, 0.0, 0.0, 0.0],
                 'filter_odom2map':          False,
-                'kalman_processVar2':       0.003,
-                'kalman_estimatedMeasVar2': 0.02,
+                'kalman_processVar2':       0.001,  # 0.003→0.001: 降低过程噪声，Kalman输出更稳定
+                'kalman_estimatedMeasVar2': 0.06,   # 0.02→0.06: 降低Kalman对ICP大跳变的信任，防止突然漂移
                 'confidence_loc_th':        0.7,
                 'dis_updatemap':            5.0,    # 3.0→5.0: 降低submap更新频率，一旦漂移不会立即把错误位置固化进submap
             },

@@ -274,6 +274,8 @@ ros2 run bot_navigation waypoint_navigator.py --list
 # 删除点位
 ros2 run bot_navigation waypoint_recorder.py delete kitchen
 
+# 新开终端：同时启动漂移监控
+ros2 run bot_navigation localization_monitor.py
 # 单点导航
 ros2 run bot_navigation waypoint_navigator.py office1
 # 多点导航
