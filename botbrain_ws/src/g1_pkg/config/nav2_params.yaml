@@ -52,8 +52,8 @@
       vx_min: -0.3
       vy_max: 0.15   # 恢复横向速度
       vy_min: -0.15
-      wz_max: 1.2    # 2.0→0.8: 限制转身速度，防止高速旋转导致ICP匹配失败
-      iteration_count: 1
+      wz_max: 0.8    # 1.2→0.8: 进一步限制旋转速度，旋转过快是ICP丢失的主因
+      iteration_count: 2             # 1→2: 每控制周期双次优化，消除转弯停顿
       prune_distance: 1.7
       transform_tolerance: 1.0
       temperature: 0.3

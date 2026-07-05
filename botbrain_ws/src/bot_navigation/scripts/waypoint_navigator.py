@@ -12,6 +12,7 @@ Options:
   --loop          repeat the sequence indefinitely
 """
 import sys
+import math
 import yaml
 import argparse
 from pathlib import Path
@@ -101,7 +102,11 @@ def navigate(names: list, db: dict, robot: str, loop: bool) -> None:
         gh_ref        = [None]   # goal handle reference for cancellation
 
         def feedback_cb(fb):
-            dist = fb.feedback.distance_remaining
+            # Use direct Euclidean distance, NOT distance_remaining (which is path length)
+            cp   = fb.feedback.current_pose.pose.position
+            dx   = cp.x - float(wp['x'])
+            dy   = cp.y - float(wp['y'])
+            dist = math.sqrt(dx * dx + dy * dy)
             now  = time.time()
             if dist <= NEAR_GOAL_M:
                 if near_since[0] is None:
