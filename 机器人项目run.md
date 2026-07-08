@@ -166,123 +166,179 @@ ros2 launch g1_manipulation_pkg manipulation_launcher.launch.py interface:=enP8p
 
 ### 建图导航
 
-**新场景建图**
+**场景建图（单场景/多楼层通用流程）**
+
+> 每套完整地图由 **3 个文件**组成：
+> - `<场景名>_scans.pcd`  → 3D 点云（供 localization 做 ICP 匹配）
+> - `<场景名>.pgm`        → 2D 栅格图像
+> - `<场景名>.yaml`       → 2D 栅格配置（记录分辨率和原点）
+>
+> **地图统一存放：**`/data/unitree/botbrain_ws/botbrain_ws/src/g1_pkg/maps/`
+
+---
+
+### 步骤 0：建图前准备
+
+⚠️ **必须停止定位/导航服务，否则会两图交织、严重漂移！**
 
 ```bash
-# 在配置文件中修改/home/unitree/botbrain_ws/botbrain_project-main/botbrain_ws/src/fast_lio/config/mid360.yaml 启动建图保存
-pcd_save_en: true
-# 重新编译
-cd ~/botbrain_ws/botbrain_project-main/
-docker compose up builder_base
-# 终端1 启动基础服务
-docker compose up bringup state_machine foxglove
-# 终端2 启动建图 建议建图时跑一个回环
-docker compose up fast_lio
-# 终端2 预计终端日志出现
-g1_robot_fast_lio  | [fastlio_mapping-2] [MAP] frame=0 feats_down=200 pcl_wait_save=1257
-g1_robot_fast_lio  | [python3-3] [INFO] [1782288159.495810154] [grid_accumulator]: frames=100 ground=4775 obs=10854 grid=505x464 origin=(-11.82,-14.31)
-# 在foxglove里可以实时查看2/3d建图效果 /map /cloud_registered_body_1
+cd /data/unitree/botbrain_ws
+docker compose stop localization navigation
 ```
 
+---
+
+### 步骤 1：配置地图保存名称
+
+修改 `mid360.yaml`（每次建图前建议先备份旧地图）
+
 ```bash
-# 终端3 保存栅格图
+# 宿主机：/data/unitree/botbrain_ws/botbrain_ws/src/fast_lio/config/mid360.yaml
+# 关键参数：
+map_file_path: “/botbrain_ws/src/g1_pkg/maps/floor1_scans.pcd”  # 场景名
+pcd_save_en: true                                               # 开启保存
+filter_size_surf: 0.3  # 推荐0.3（大楼层防漂移）
+filter_size_map: 0.3
+```
+
+> 命名规范：`floor1`、`office_A`、`corridor_2F` | yaml改完无需重编译
+
+---
+
+### 步骤 2：启动建图服务
+
+⚠️ **用 `stop` + `up`，不用 `restart`**（清除缓存）
+
+```bash
+docker compose up bringup state_machine foxglove  # 终端1 需要进行等待到雷达开启
+docker compose stop fast_lio                      # 终端2：彻底停止
+docker compose up fast_lio                        # 重新启动，等15s
+```
+
+就绪日志：`[MAP] frame=0 feats_down=200~600 pcl_wait_save=持续增长`
+
+---
+
+### 步骤 3：Foxglove 查看建图 + 开始行走
+
+**Foxglove 设置：**固定参考系选 **`camera_init`**
+
+**行走要点：**
+- 速度慢（≤ 0.3m/s）
+- 转弯慢（≤ 0.2 rad/s）
+- 走回环（回到起点闭环）
+
+---
+
+### 步骤 4：保存地图
+
+**保存 2D 栅格图：**
+```bash
 docker exec -it g1_robot_fast_lio bash
 source install/setup.bash
 ros2 run nav2_map_server map_saver_cli \
-     -t /accumulated_grid \
-     --free 0.196 --occ 0.65 \
-     -f /botbrain_ws/src/g1_pkg/maps/accumulated
-# -f 最后的“accumulated”是保存下来后栅格图的名称
-# 保存点云图
-kill -SIGINT $(pgrep fastlio_mapping)
-# 默认都保存到src/g1_pkg/maps 文件夹
-# 地图保存后 将yaml文件建图保存功能关闭，并重新编译
+     -t /accumulated_grid --free 0.196 --occ 0.65 \
+     -f /botbrain_ws/src/g1_pkg/maps/floor1  # 与上面场景名一致
+exit
 ```
 
+**保存 3D 点云：**
 ```bash
-# 如果保存的地图名称不同，需要在src/g1_pkg/launch/localization_3d_.launch.py 中修改名称
-default_pcd_path  = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'scans.pcd')
-default_grid_yaml = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'accumulated.yaml')
-# 保存后需要重新编译
+docker exec g1_robot_fast_lio bash -c “kill -SIGINT \$(pgrep fastlio_mapping)”
+# 自动保存到 mid360.yaml 指定的 map_file_path
 ```
 
-**多场景/多楼层地图管理**
-
-每套地图由三个文件组成，命名规范：`<场景名>_scans.pcd` + `<场景名>.yaml` + `<场景名>.pgm`
-
+**确认生成：**
 ```bash
-# 步骤1：建图前在 mid360.yaml 里指定点云保存路径（需 pcd_save_en: true）
-map_file_path: "/botbrain_ws/src/g1_pkg/maps/floor1_scans.pcd"
-
-# 步骤2：建图结束后保存栅格图，-f 后面的名字就是地图名
-docker exec -it g1_robot_fast_lio bash
-source install/setup.bash
-ros2 run nav2_map_server map_saver_cli \
-     -t /accumulated_grid \
-     --free 0.196 --occ 0.65 \
-     -f /botbrain_ws/src/g1_pkg/maps/floor1
-# 生成 floor1.yaml + floor1.pgm
-
-# 步骤3：保存点云（路径由上面 mid360.yaml 指定）
-kill -SIGINT $(pgrep fastlio_mapping)
-# 生成 floor1_scans.pcd
-# 地图保存后将 yaml 文件建图保存功能关闭(pcd_save_en: false)，并重新编译
+ls -lh /data/unitree/botbrain_ws/botbrain_ws/src/g1_pkg/maps/ | grep floor1
+# 应有：floor1_scans.pcd、floor1.pgm、floor1.yaml
 ```
 
+**关闭保存开关：**
 ```bash
-# 切换地图方法一：改 localization_3d.launch.py 默认值后重新编译
+# 改 mid360.yaml: pcd_save_en: false
+```
+
+---
+
+### 切换地图（导航时用哪张）
+
+修改 `localization_3d.launch.py` 默认值：
+```bash
+# 宿主机：/data/unitree/botbrain_ws/botbrain_ws/src/g1_pkg/launch/localization_3d.launch.py
 default_pcd_path  = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'floor1_scans.pcd')
 default_grid_yaml = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'floor1.yaml')
-
-# 切换地图方法二：启动时传参，无需重新编译（推荐）
-docker compose exec localization bash -c \
-  "source install/setup.bash && ros2 launch g1_pkg localization_3d.launch.py \
-   map_file:=/botbrain_ws/src/g1_pkg/maps/floor1_scans.pcd"
+# .launch.py 是 Python 文件，改完无需重编译，重启 localization 生效
 ```
+
+```bash
+cd /data/unitree/botbrain_ws
+docker compose restart localization
+```
+
+---
+
+### 已有地图一览（示例）
+
+| 场景名 | PCD 文件 | 栅格文件 | 备注 |
+|--------|---------|---------|------|
+| 默认场景 | `scans.pcd` | `accumulated.yaml` + `accumulated.pgm` | localization 默认加载 |
+| 办公室1 | *(无)* | `office1.yaml` + `office1.pgm` | 只有2D图，缺3D点云 |
+| 固定地图 | *(无)* | `fixed_map.yaml` + `fixed_map.pgm` | 只有2D图 |
 
 **启动建图定位服务**
 
 ```bash
-cd ~/botbrain_ws/botbrain_project-main/
+cd /data/unitree/botbrain_ws
+
 # 终端1 启动基础服务
 docker compose up bringup state_machine foxglove
+
 # 终端2 启动建图定位服务
 docker compose up fast_lio localization
 # 情况1 机器人初始位姿与建图时机器人所在的初始位姿基本一致
 #      则不需要对发布初始位姿参数进行校正机器人在地图上的位姿
 # 情况2 机器人初始位姿与建图时机器人所在位姿有较大偏差(位置超过1m或角度超过90度)
-#       则需要通过可视化页面rviz/foxglove 发送/initialpose 话题去指定机器人当前在地图上的位姿
-# 当localization的日志参数reg_result.fitness大于0.9即完成ICP匹配
+#       则需要通过可视化页面 Foxglove 发送 /initialpose 话题去指定机器人当前在地图上的位姿
+# 当 localization 的日志参数 reg_result.fitness 大于 0.9 即完成 ICP 匹配
 ```
 
 ```bash
-cd ~/botbrain_ws/botbrain_project-main/
+cd /data/unitree/botbrain_ws
+
 # 终端3 启动导航服务
 docker compose up navigation
-# 可以从可视化页面发送/g1_robot/goal_pose 话题开始导航
+# 可以从 Foxglove 发送 /g1_robot/goal_pose 话题开始导航
 
-# 记录目标点位(以下的命令都需要进行进入容器和source)
+# 记录目标点位（以下命令需要先进入容器并 source）
 docker exec -it g1_robot_bringup bash
 source install/setup.bash
 
+# 记录当前位置为点位（例如命名为 office）
 ros2 run bot_navigation waypoint_recorder.py record office
-# 目标点位信息会记录到 src/bot_navigation/nav_waypoints.yaml 文件里
-# 查看已经存在的点位
+# 目标点位信息记录到容器内：/botbrain_ws/src/bot_navigation/nav_waypoints.yaml
+# 宿主机路径：/data/unitree/botbrain_ws/botbrain_ws/src/bot_navigation/nav_waypoints.yaml
+
+# 查看已有点位
 ros2 run bot_navigation waypoint_recorder.py list
 # 或
 ros2 run bot_navigation waypoint_navigator.py --list
+
 # 删除点位
 ros2 run bot_navigation waypoint_recorder.py delete kitchen
 
-# 新开终端：同时启动漂移监控
+# 新开终端：启动漂移监控（推荐与导航同时运行）
 ros2 run bot_navigation localization_monitor.py
+
 # 单点导航
 ros2 run bot_navigation waypoint_navigator.py office1
-# 多点导航
-ros2 run bot_navigation waypoint_navigator.py office1 office2 office3 turn office4 office5 office1 home  # 末尾添加 --loop 参数可进行循环导航，ctrl+c退出 
 
-#foxglove话题配置文件
-/home/unitree/botbrain_ws/botbrain_project-main/botbrain_ws/src/bot_bringup/config/foxglove_bridge_params.yaml
+# 多点导航（末尾加 --loop 可循环，Ctrl+C 退出）
+ros2 run bot_navigation waypoint_navigator.py office1 office2 office3 turn office4 office5 office1 home
+
+# Foxglove 话题配置文件路径
+# 宿主机：/data/unitree/botbrain_ws/botbrain_ws/src/bot_bringup/config/foxglove_bridge_params.yaml
+# 容器内：/botbrain_ws/src/bot_bringup/config/foxglove_bridge_params.yaml
 ```
 > ⚠️ **服务启动延迟说明（勿在日志未就绪前判断失败）**
 >
@@ -315,52 +371,68 @@ ros2 run bot_navigation waypoint_navigator.py office1 office2 office3 turn offic
 **启动导航服务(想要开导航就需要开启建图定位)**
 ### 代码更新与重编译
 
-#### 是否需要重新编译？
+#### ⚠️ 重要：必须 build 才能生效
 
-> 源码通过 volume 挂载到容器（`./botbrain_ws/:/botbrain_ws`），
-> 主机上修改文件后容器里立即可见，**Python / 配置类改完重启服务就行**。
+> 本项目编译时**未使用 `--symlink-install`**，因此 `install/` 是独立副本，**不是** `src/` 的软链接。
+>
+> **所有对 `src/` 的修改（无论是 Python、YAML 还是 C++）都需要重新 build 才能生效。**
+> 直接重启服务而不 build，运行的仍然是 `install/` 里的旧版本。
 
 | 修改的文件类型 | 需要重编译 | 操作 |
 |---|:---:|---|
-| Python 脚本 (`.py`) | ❌ | 重启对应服务 |
-| Launch 文件 (`.launch.py`) | ❌ | 重启对应服务 |
-| 配置文件 (`.yaml` / `.json`) | ❌ | 重启对应服务 |
-| 地图文件 (`.pcd` / `.pgm`) | ❌ | 重启对应服务 |
-| C++ 源码 (`.cpp` / `.hpp`) | ✅ | 先编译再重启 |
-| `CMakeLists.txt` / `package.xml` | ✅ | 先编译再重启 |
+| Python 脚本 (`.py`) | ✅ | **先 build 再重启** |
+| Launch 文件 (`.launch.py`) | ✅ | **先 build 再重启** |
+| 配置文件 (`.yaml` / `.json`) | ✅ | **先 build 再重启** |
+| 地图文件 (`.pcd` / `.pgm`) | ❌ | 重启对应服务即可（直接读文件路径） |
+| C++ 源码 (`.cpp` / `.hpp`) | ✅ | **先 build 再重启** |
+| `CMakeLists.txt` / `package.xml` | ✅ | **先 build 再重启** |
 
-#### 重启服务（无需编译时）
+#### 标准修改流程（所有代码改动）
 
-```bash
-cd ~/botbrain_ws/botbrain_project-main/
-# 重启指定服务（如只改了导航的 py 脚本）
-docker compose restart navigation
-# 重启多个服务
-docker compose restart bringup state_machine
-# 停止再重启（比 restart 更彻底，确保配置重新加载）
-docker compose stop navigation && docker compose up navigation
-```
-
-#### 重新编译（C++ 代码或 CMakeLists 变更时）
+> `docker compose up builder_base` 本质是执行 `colcon build --packages-select <所有包>`，
+> **不是只起一个空容器**，它运行完会自动退出（`exited with code 0` = 编译成功）。
+> `install/` 目录由 colcon 自动更新，**不要手动 cp**。
 
 ```bash
-cd ~/botbrain_ws/botbrain_project-main/
-# 编译所有包（约 3~10 分钟）
+cd /data/unitree/botbrain_ws
+
+# 步骤1：修改 src/ 下的源文件
+
+# 步骤2：colcon build 更新 install/（等待 exited with code 0）
 docker compose up builder_base
-# 看到 exited with code 0 说明编译成功，再重启受影响的服务
-docker compose restart fast_lio localization
+
+# 步骤3：重启受影响的服务（让进程重新加载 install/ 里的新文件）
+docker compose stop fast_lio && docker compose up -d fast_lio
 ```
 
-> 服务 → 源码包 → 操作对照
+#### 只编译特定包（改动少时更快）
 
-| 服务名 | 主要源码包 | 语言 | 改动后操作 |
+> `builder_base` 已包含 `fast_lio` 和 `g1_pkg`，下面命令仅编译这两个包，速度更快。
+
+```bash
+cd /data/unitree/botbrain_ws
+
+docker compose run --rm builder_base bash -c \
+  "source /opt/ros/humble/setup.bash && \
+   cd /botbrain_ws && \
+   colcon build --packages-select fast_lio g1_pkg \
+   --cmake-args -DCMAKE_BUILD_TYPE=Release \
+               -DOpen3D_DIR=/opt/open3d/lib/cmake/Open3D"
+
+# 编译成功后重启服务
+docker compose stop fast_lio && docker compose up -d fast_lio
+```
+
+#### 服务 → 源码包 → 完整操作流程
+
+| 服务名 | 主要源码包 | 编译命令 | 重启命令 |
 |---|---|---|---|
-| `bringup` | `bot_bringup`, `g1_pkg` | Python + 配置 | `docker compose restart bringup` |
-| `fast_lio` | `fast_lio` | C++ | 编译后 `restart fast_lio` |
-| `localization` | `open3d_loc` | C++ | 编译后 `restart localization` |
-| `navigation` | `bot_navigation`, `g1_pkg` | Python | `docker compose restart navigation` |
-| `state_machine` | `bot_state_machine` | Python | `docker compose restart state_machine` |
-| `yolo` | `bot_yolo` | Python + C++ | `docker compose up builder_yolo` 后 restart |
+| `fast_lio` | `fast_lio`, `g1_pkg` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select fast_lio g1_pkg"` | `docker compose stop fast_lio && docker compose up -d fast_lio` |
+| `localization` | `open3d_loc` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select open3d_loc"` | `docker compose stop localization && docker compose up -d localization` |
+| `navigation` | `bot_navigation`, `g1_pkg` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select bot_navigation g1_pkg"` | `docker compose stop navigation && docker compose up -d navigation` |
+| `bringup` | `bot_bringup`, `g1_pkg` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select bot_bringup g1_pkg"` | `docker compose stop bringup && docker compose up -d bringup` |
+| `state_machine` | `bot_state_machine` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select bot_state_machine"` | `docker compose stop state_machine && docker compose up -d state_machine` |
+| `yolo` | `bot_yolo` | `docker compose up builder_yolo` | `docker compose restart yolo` |
 
 ---
 

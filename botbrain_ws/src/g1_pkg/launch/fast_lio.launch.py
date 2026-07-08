@@ -46,13 +46,21 @@ def generate_launch_description():
                 '--grid-topic',     '/accumulated_grid',
                 '--map-frame',      'camera_init',
                 '--resolution',     '0.05',
-                # Map-frame z thresholds (camera_init origin = IMU start position,
-                # floor ≈ -1.1 m, ceiling ≈ 3.0 m in typical indoor start).
-                '--ground-z-min',   '-1.5',   # below → step-down obstacle
-                '--ground-z',       '-0.8',   # floor band upper edge → FREE
-                '--obstacle-z',     '-0.8',   # above floor → OCCUPIED
-                '--obstacle-z-max', '0.3',    # ignore ceiling & above (2.5m room - 1.2m IMU ≈ 1.3m)
+                # Map-frame z thresholds (camera_init origin = IMU start position).
+                # Sensor height H ≈ 1.3 m → floor is at z ≈ -1.3 m in camera_init.
+                #
+                # z classification layout (H=1.3m example):
+                #   z > +1.0 → ignored (ceiling)
+                #   z -1.0 ~ +1.0 → OCCUPIED (walls: 0.3 m above floor to 2.3 m above floor)
+                #   z -1.7 ~ -1.0 → FREE (floor band, centre ≈ -1.3 m)
+                #   z < -1.7 → OCCUPIED (step-down / drop-off)
+                '--ground-z-min',   '-1.7',   # drops below -1.7 m → OCCUPIED
+                '--ground-z',       '-1.0',   # floor FREE band: -1.7 ~ -1.0 (0.3 m above floor)
+                '--obstacle-z',     '-1.0',   # walls/obstacles start 0.3 m above floor
+                '--obstacle-z-max', '1.0',    # ceiling cutoff: floor+2.3 m (safe for 2.5 m rooms)
                 '--skip-frames',    '30',
+                '--min-obs-hits',   '3',   # 需命中3次才标记OCCUPIED，减少路人误识别
+                '--map-z',          '-1.27',  # 传感器离地1.27m，地图显示在地面高度
             ],
             output='screen',
         ))
