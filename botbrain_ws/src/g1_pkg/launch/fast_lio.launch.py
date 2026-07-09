@@ -15,17 +15,11 @@ def generate_launch_description():
         mid360 = yaml.safe_load(f)
     pcd_save_en = mid360.get('/**', {}).get('ros__parameters', {}).get('pcd_save', {}).get('pcd_save_en', False)
 
-    # imu_flip: negate IMU Y/Z before fast_lio sees it.
-    # MID360 roll-180 mount → SDK corrects pointcloud (Z-up) but publishes IMU
-    # in raw sensor frame (Z-down). The flip brings IMU into the same Z-up frame
-    # so extrinsic_R=identity is correct and the map stays right-side-up.
+    # imu_flip.py REMOVED — matches g1_3d_nav_ros2 reference.
+    # The Livox SDK already publishes IMU in the correct Z-up frame;
+    # the YZ-flip was likely compensating for an older SDK version and
+    # introduced gravity misalignment → tilt + drift.
     actions = [
-        Node(
-            package='g1_pkg',
-            executable='imu_flip.py',
-            name='imu_flip',
-            output='screen',
-        ),
         Node(
             package='fast_lio',
             executable='fastlio_mapping',
@@ -40,27 +34,26 @@ def generate_launch_description():
             cmd=[
                 'python3',
                 '/botbrain_ws/install/g1_pkg/lib/g1_pkg/grid_accumulator.py',
-                # Use /cloud_registered (already in camera_init/map frame) —
-                # eliminates TF lookup and the concentric-ring artifact.
-                '--cloud-topic',    '/cloud_registered_1',
+                # ---- Body-frame classification (matches g1_3d_nav_ros2 reference) ----
+                # Classify in body frame (z relative to robot) → TF to map frame.
+                # With extrinsic_T z=1.247, body origin ≈ ground level:
+                #   body-frame floor z≈0, LiDAR at z≈1.247
+                #   z < 0.15 → FREE (ground),  z > 0.25 → OCCUPIED
+                # This is inherently TILT-PROOF — body frame is relative to robot.
+                '--no-pre-transformed',            # enable TF body→map lookup
+                '--cloud-topic',    '/cloud_registered_body_1',
                 '--grid-topic',     '/accumulated_grid',
                 '--map-frame',      'camera_init',
+                '--body-frame',     'body',
                 '--resolution',     '0.05',
-                # Map-frame z thresholds (camera_init origin = IMU start position).
-                # Sensor height H ≈ 1.3 m → floor is at z ≈ -1.3 m in camera_init.
-                #
-                # z classification layout (H=1.3m example):
-                #   z > +1.0 → ignored (ceiling)
-                #   z -1.0 ~ +1.0 → OCCUPIED (walls: 0.3 m above floor to 2.3 m above floor)
-                #   z -1.7 ~ -1.0 → FREE (floor band, centre ≈ -1.3 m)
-                #   z < -1.7 → OCCUPIED (step-down / drop-off)
-                '--ground-z-min',   '-1.7',   # drops below -1.7 m → OCCUPIED
-                '--ground-z',       '-1.0',   # floor FREE band: -1.7 ~ -1.0 (0.3 m above floor)
-                '--obstacle-z',     '-1.0',   # walls/obstacles start 0.3 m above floor
-                '--obstacle-z-max', '1.0',    # ceiling cutoff: floor+2.3 m (safe for 2.5 m rooms)
-                '--skip-frames',    '30',
-                '--min-obs-hits',   '3',   # 需命中3次才标记OCCUPIED，减少路人误识别
-                '--map-z',          '-1.27',  # 传感器离地1.27m，地图显示在地面高度
+                '--ground-z-min',   '-100',  # effectively no lower bound
+                '--ground-z',       '0.15',  # body frame: z<0.15m = ground (floor at z≈0)
+                '--obstacle-z',     '0.25',  # body frame: z>0.25m = obstacle
+                '--obstacle-z-max', '100',   # effectively no upper bound
+                '--skip-frames',    '30',    # FAST-LIO warmup
+                '--min-obs-hits',   '3',     # 3 hits to confirm obstacle
+                '--map-z',          '0.0',   # body origin at ground level
+                '--no-ground-plane',          # body-frame is inherently tilt-proof
             ],
             output='screen',
         ))
