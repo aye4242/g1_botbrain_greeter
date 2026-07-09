@@ -222,16 +222,20 @@ docker compose up fast_lio                        # 重新启动，等15s
 **方式二：RViz2（workstation 端，备用）**
 
 ```bash
-# workstation 端，前提：G1 上建图服务已启动（bringup + fast_lio）
+# workstation 端，前提：G1 上建图服务已启动（zenoh + bringup + fast_lio）
 source /opt/ros/humble/setup.bash
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-# 同子网下 CycloneDDS 多播自动发现，无需额外配置
-# 跨子网需加 Peer：export CYCLONEDDS_URI="<CycloneDDS><Domain><General><Peers><Peer Address=\"192.168.100.30\"/></Peers></General></Domain></CycloneDDS>"
+export RMW_IMPLEMENTATION=rmw_zenoh_cpp
+export ZENOH_CONFIG_OVERRIDE='mode="client";connect/endpoints=["tcp/192.168.100.30:7448"]'
 ros2 daemon stop  >/dev/null 2>&1 || true
 ros2 daemon start >/dev/null 2>&1 || true
 sleep 3
+# 验证数据到达
+ros2 topic info /Odometry_loc | grep "Publisher count"
+# Publisher count: 1 → ✅ 可以开 RViz2
 rviz2 -d /home/aitech/Workspace/botbrain_project/configs/g1_mapping_rviz2.rviz
 ```
+
+> 💡 参考项目 `g1_3d_nav_ros2` 同款方式：Zenoh TCP 直连 G1:7448，不依赖多播，稳定可靠。Fixed Frame 选 `camera_init`。
 
 > 💡 **Foxglove vs RViz2**：Foxglove 浏览器开箱即用、3D 渲染流畅；RViz2 原生 ROS 2 支持、TF 树/话题调试更强。两者可**同时使用**，不冲突。
 
@@ -539,10 +543,12 @@ docker compose up navigation   # 终端3
 # 方式一：Foxglove 发送 /g1_robot/goal_pose 开始导航
 # 方式二：Workstation RViz2（备用）
 source /opt/ros/humble/setup.bash
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export RMW_IMPLEMENTATION=rmw_zenoh_cpp
+export ZENOH_CONFIG_OVERRIDE='mode="client";connect/endpoints=["tcp/192.168.100.30:7448"]'
 ros2 daemon stop  >/dev/null 2>&1 || true
 ros2 daemon start >/dev/null 2>&1 || true
 sleep 3
+ros2 topic info /Odometry_loc | grep "Publisher count"
 rviz2 -d /home/aitech/Workspace/botbrain_project/configs/g1_nav_loc_rviz2.rviz
 ```
 
