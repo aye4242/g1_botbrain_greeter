@@ -209,6 +209,8 @@ filter_size_map: 0.5
 docker compose up bringup state_machine foxglove  # 终端1：等待雷达就绪
 docker compose stop fast_lio                      # 终端2：彻底停止旧进程
 docker compose up fast_lio                        # 重新启动，等15s
+
+docker logs g1_robot_fast_lio 2>&1 | grep "IMU Initial" #查看IMU初始化,等待初始化成功再进行移动
 ```
 
 就绪日志：`[MAP] frame=0 feats_down=200~600 pcl_wait_save=持续增长`
