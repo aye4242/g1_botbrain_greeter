@@ -7,7 +7,7 @@ from launch_ros.actions import Node
 xfer_format   = 1    # 1-CustomMsg (per-point timestamps, required for humanoid motion compensation)
 multi_topic   = 0
 data_src      = 0
-publish_freq  = 20.0
+publish_freq  = 10.0
 output_type   = 0
 frame_id      = 'mid360_link'
 lvx_file_path = '/home/livox/livox_test.lvx'
