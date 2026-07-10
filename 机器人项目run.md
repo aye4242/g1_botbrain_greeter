@@ -226,6 +226,7 @@ docker compose up fast_lio                        # 重新启动，等15s
 source /opt/ros/humble/setup.bash
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 export ZENOH_CONFIG_OVERRIDE='mode="client";connect/endpoints=["tcp/192.168.100.30:7448"]'
+# 香港 G1：export ZENOH_CONFIG_OVERRIDE='mode="client";connect/endpoints=["tcp/192.168.37.204:7448"]'
 ros2 daemon stop  >/dev/null 2>&1 || true
 ros2 daemon start >/dev/null 2>&1 || true
 sleep 3
@@ -545,6 +546,7 @@ docker compose up navigation   # 终端3
 source /opt/ros/humble/setup.bash
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 export ZENOH_CONFIG_OVERRIDE='mode="client";connect/endpoints=["tcp/192.168.100.30:7448"]'
+# 香港 G1：export ZENOH_CONFIG_OVERRIDE='mode="client";connect/endpoints=["tcp/192.168.37.204:7448"]'
 ros2 daemon stop  >/dev/null 2>&1 || true
 ros2 daemon start >/dev/null 2>&1 || true
 sleep 3
