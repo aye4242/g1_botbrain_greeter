@@ -1,3 +1,8 @@
+x-robot-env: &robot-env
+  env_file:
+    - path: ${BOTBRAIN_ROBOT_ENV_FILE:-/etc/botbrain/robot.env}
+      required: false
+
 services:
   base:
     image: botbotrobotics/botbrain:base
@@ -22,12 +27,13 @@ services:
       - /usr/local/include:/opt/robot_sdk/include:ro
       - /usr/local/lib:/opt/robot_sdk/lib:ro
     environment:
-      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
-      CYCLONEDDS_URI: "file:///botbrain_ws/cyclonedds_config.xml"
+      RMW_IMPLEMENTATION: rmw_zenoh_cpp
+      ZENOH_CONFIG_OVERRIDE: 'mode="client";connect/endpoints=["tcp/127.0.0.1:7448"]'
       UNITREE_SDK2_ROOT: /opt/robot_sdk
       LD_LIBRARY_PATH: /opt/open3d/lib
 
   nav3d:
+    <<: *robot-env
     image: botbotrobotics/botbrain:nav3d
     stdin_open: true
     tty: true
@@ -50,8 +56,8 @@ services:
       - /usr/local/include:/opt/robot_sdk/include:ro
       - /usr/local/lib:/opt/robot_sdk/lib:ro
     environment:
-      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
-      CYCLONEDDS_URI: "file:///botbrain_ws/cyclonedds_config.xml"
+      RMW_IMPLEMENTATION: rmw_zenoh_cpp
+      ZENOH_CONFIG_OVERRIDE: 'mode="client";connect/endpoints=["tcp/127.0.0.1:7448"]'
       UNITREE_SDK2_ROOT: /opt/robot_sdk
       LD_LIBRARY_PATH: /opt/open3d/lib
 
@@ -85,6 +91,14 @@ services:
           open3d_loc \
           --cmake-args -DOpen3D_DIR=/opt/open3d/lib/cmake/Open3D"]
 
+  zenoh:
+    image: botbotrobotics/botbrain:nav3d
+    network_mode: host
+    ipc: host
+    container_name: g1_robot_zenoh
+    command: ["bash", "-lc", "source /opt/ros/humble/setup.bash && ZENOH_CONFIG_OVERRIDE='listen/endpoints=[\"tcp/0.0.0.0:7448\"]' ros2 run rmw_zenoh_cpp rmw_zenohd"]
+    restart: always
+
   state_machine:
     extends: base
     container_name: g1_robot_state_machine
@@ -108,13 +122,13 @@ services:
   fast_lio:
     extends: nav3d
     container_name: g1_robot_fast_lio
-    command: ["bash", "-lc", "sleep 15 && source install/setup.bash && ros2 launch g1_pkg fast_lio.launch.py"]
+    command: ["bash", "-lc", "sleep 25 && source install/setup.bash && ros2 launch g1_pkg fast_lio.launch.py"]
     restart: always
 
   localization:
     extends: nav3d
     container_name: g1_robot_localization
-    command: ["bash", "-lc", "sleep 30 && source install/setup.bash && export LD_LIBRARY_PATH=/opt/open3d/lib:$LD_LIBRARY_PATH && ros2 launch g1_pkg localization_3d.launch.py"]
+    command: ["bash", "-lc", "/botbrain_ws/start_localization.sh"]
     restart: always
 
   navigation:
@@ -216,7 +230,7 @@ services:
     volumes:
       - ./frontend:/app
     env_file:
-      - .env
+      - ./frontend/.env
 
   web_server_builder:
     extends: web_server
@@ -238,8 +252,9 @@ services:
     network_mode: host
     environment:
       - NODE_ENV=production
+      - PORT=80
     env_file:
-      - .env
+      - ./frontend/.env
     command: npm run start
     restart: unless-stopped
   
