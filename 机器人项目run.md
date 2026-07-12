@@ -197,8 +197,11 @@ docker compose stop localization navigation
     map_file_path: "/botbrain_ws/src/g1_pkg/maps/floor1_scans.pcd"
 
     common:
-      # MID360 倒装 180°，FAST-LIO 必须使用 imu_flip.py 修正后的 IMU。
-      imu_topic: "/livox/imu_corrected"
+      # MID360 倒装 180°：直接订阅原始 IMU，在 FAST-LIO C++ 内做 Y/Z 翻转。
+      imu_topic: "/livox/imu"
+      imu_flip_yz: true
+      imu_queue_depth: 2000
+      lidar_queue_depth: 100
 
     mapping:
       extrinsic_est_en: false
@@ -211,11 +214,13 @@ docker compose stop localization navigation
 
 > ⚠️ **不要把 `1.247` 写进 `extrinsic_T.z`。** `1.247 m` 是机器人站立时 MID360/IMU 到地面的高度，只用于实时栅格显示高度和建图后 PCD 地面平移；`extrinsic_T` 表示 LiDAR 相对 MID360 **内置 IMU** 的刚性外参。
 >
-> ⚠️ MID360 在 `MID360_config.json` 和 URDF 中均为绕 X 轴倒装 180°。点云已按该安装姿态旋转，而当前驱动发布的原始 `/livox/imu` 仍需做 `R_x(π)` 修正，即 **X 不变、Y/Z 取反**。因此 FAST-LIO 必须订阅 `/livox/imu_corrected`。
+> ⚠️ MID360 在 `MID360_config.json` 和 URDF 中均为绕 X 轴倒装 180°。点云已按该安装姿态旋转，而驱动发布的原始 `/livox/imu` 仍需做 `R_x(π)` 修正，即 **X 不变、Y/Z 取反**。当前默认实现由 FAST-LIO 的 C++ `imu_cbk()` 在节点内部完成，因此订阅原始 `/livox/imu`，不再经过 Python relay。
+>
+> ⚠️ `imu_flip.py` 和 `/livox/imu_corrected` 仅保留作诊断/回退工具。**禁止同时启用 Python 翻转与 `common.imu_flip_yz: true`**，否则会双重翻转并恢复成错误轴向。
 
 > 命名规范：`floor1`、`office_A`、`corridor_2F`。yaml 或 Python/C++ 改完后需重新 build 才能进入 install 空间。建议本次只编译相关包：
 >
-> `docker compose run --rm builder_base bash -lc "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select fast_lio g1_pkg --cmake-args -DCMAKE_BUILD_TYPE=Release -DOpen3D_DIR=/opt/open3d/lib/cmake/Open3D"`
+> `docker compose run --rm builder_base bash -lc "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select fast_lio g1_pkg open3d_loc --cmake-args -DCMAKE_BUILD_TYPE=Release -DOpen3D_DIR=/opt/open3d/lib/cmake/Open3D"`
 
 
 ### 步骤 2：启动建图服务并确认 IMU 修正
@@ -236,7 +241,7 @@ docker compose up fast_lio
 docker logs g1_robot_fast_lio 2>&1 | grep "IMU Initial"
 ```
 
-在另一个终端确认原始 IMU、修正 IMU和世界点云都在持续发布（每条 `hz` 命令单独运行，观察后按 Ctrl+C）：
+在另一个终端确认原始 IMU和世界点云都在持续发布（每条 `hz` 命令单独运行，观察后按 Ctrl+C）：
 
 ```bash
 docker exec -it g1_robot_fast_lio bash
@@ -244,21 +249,22 @@ source /opt/ros/humble/setup.bash
 source /botbrain_ws/install/setup.bash
 
 ros2 topic hz /livox/imu
-ros2 topic hz /livox/imu_corrected
+ros2 topic info -v /livox/imu
 ros2 topic hz /cloud_registered_1
 
 ros2 topic echo /livox/imu --once
-ros2 topic echo /livox/imu_corrected --once
 exit
 ```
 
 诊断标准：
 
-- `/livox/imu` 与 `/livox/imu_corrected` 都必须有稳定频率，不能只有其中一个有数据。
-- corrected 相对 raw：`angular_velocity.x`、`linear_acceleration.x` 不变；Y/Z 分量符号相反。
-- 静止时 corrected 平均加速度模长应接近重力加速度，日志会打印前 200 个样本的均值与 `|a|`。
+- `/livox/imu` 必须持续稳定发布；`ros2 topic info -v` 中 publisher/subscriber 的 QoS 必须兼容。
+- FAST-LIO 启动日志必须显示 `imu=/livox/imu flip_yz=true imu_q=2000 lidar_q=100 guard=true`。
+- 静止时原始加速度模长应接近重力加速度；Y/Z 翻转在 FAST-LIO 内部完成，不会额外发布 corrected 话题。
 - 必须等待 FAST-LIO 打印 **`IMU Initial Done`** 后再移动。
-- 开启 PCD 保存时，`[MAP] frame=100, 200, 300...` 应递增，`pcl_wait_save` 应持续增长；不应一直显示 `frame=0`。
+- `[FAST_LIO_TIMING]` 应约每 2 秒出现；正常 10 Hz 扫描通常 `scan≈0.05–0.15s`、`imu_count>=5`、`max_gap<=0.02s`。
+- `[FAST_LIO_GUARD]` 出现 rejected 表示异常 LiDAR 更新已回滚且没有写入 ikd-tree/PCD；连续拒帧后可能出现 `state-only recovery`，该恢复帧只修 EKF 状态、仍不写地图；下一严格好帧出现 recovered 后才恢复地图写入。
+- 开启 PCD 保存时，`[MAP] frame=100, 200, 300...` 应递增，`pcl_wait_save` 应持续增长；被 guard 拒绝的帧不会增加地图点。
 
 
 ### 步骤 3：查看建图 + 驱动行走
@@ -294,10 +300,11 @@ rviz2 -d /home/aitech/Workspace/botbrain_project/configs/g1_mapping_rviz2.rviz
 
 **先做转弯小范围验收，再正式建图：**
 
-1. 机器人静止至 `IMU Initial Done`。
-2. 原地非常慢地左转 20–30°，停住，再回正。
-3. 原地非常慢地右转 20–30°，停住，再回正。
-4. 正常表现应是：机器人模型/`body` TF 转动，走廊和墙体仍固定在 `camera_init` 中。
+1. 机器人静止至 `IMU Initial Done`，再静止观察约 30 秒 `[FAST_LIO_TIMING]`。
+2. 原地慢速左转 20–30°，停 3 秒，然后向前走约 1 m。
+3. 原地慢速右转 20–30°，停 3 秒，然后向前走约 1 m。
+4. 做一次 90° 走廊转弯，逐级提高速度，不要一开始就急转。
+5. 正常表现应是：机器人模型/`body` TF 转动，走廊和墙体仍固定在 `camera_init` 中；即使某帧质量差被 guard 拒绝，后续好帧也应能 recovered，而不是不可恢复发散。
 
 **正式建图行走要点：**
 
@@ -420,12 +427,14 @@ docker compose logs -f localization | grep fitness
 
 | 现象 | 可视化表现 | 日志/话题表现 | 主要原因 | 解决方案 |
 |------|-------------|---------------|---------|---------|
-| **转弯时整片世界点云随机器人旋转** | Foxglove 在 `camera_init → camera_init` 下，`/cloud_registered_1` 中走廊也跟着转 | `/livox/imu_corrected` 无数据，或 FAST-LIO 配置仍订阅 `/livox/imu` | 倒装 MID360 的原始 IMU 未做 Y/Z 翻转，点云与 IMU 轴向不一致 | 启动 `imu_flip.py`，确认 `imu_topic: /livox/imu_corrected`，再按 ±20–30° 慢转验收 |
+| **转弯时整片世界点云随机器人旋转** | Foxglove 在 `camera_init → camera_init` 下，`/cloud_registered_1` 中走廊也跟着转 | FAST-LIO 启动日志显示 `flip_yz=false`，或误启了 Python+C++ 双重翻转 | 倒装 MID360 的 IMU 轴向修正未生效或被执行两次 | 确认 `imu_topic: /livox/imu`、`imu_flip_yz: true`，并确保没有启动 `imu_flip.py` |
 | **转弯伴随明显假平移/重影** | 机器人一转，墙体既旋转又横移 | `mid360.yaml` 中 `extrinsic_T.z=1.247` | 把传感器离地高度误当成 LiDAR–内置 IMU 外参，形成约 1.2 m 的虚假杠杆臂 | 恢复 `extrinsic_T: [-0.011, -0.02329, 0.04412]`；1.247 只用于栅格/PCD 高度处理 |
 | **body 点云随机器人移动** | `/cloud_registered_body_1` 相对机器人几乎静止 | 话题 `frame_id=body` | 这是 body-frame 话题的正常定义 | 判断地图稳定性时改看 `/cloud_registered_1` |
 | **地图倾斜** | 3D 点云侧看地面不水平 | `tilt > 5°` | IMU 轴向错误，或初始化时机器人未站稳 | 先核对 raw/corrected IMU 符号，再保持静止直到 `IMU Initial Done` 后重建 |
 | **高度漂移** | 点云整体上下移动 | `floor_z` 持续变化 | IMU 初始化、振动、时间同步或噪声参数问题 | 先排除轴向/外参，再检查时间戳、机械固定和 IMU 数据稳定性 |
 | **XY 漂移/返回起点不闭合** | 地图逐渐拉长，旧墙与新墙错开 | 无全局回环优化日志 | 当前 FAST-LIO 只有局部 scan-to-map；长直走廊会退化，累计误差不会自动回改 | 降速、增加拐角/门框等几何约束；返回起点只用于量误差，不能靠"走两遍"消除历史漂移 |
+| **转弯稳定后再次移动突然不可恢复漂移** | 停住时短暂稳定，一起步地图/机器人突然跳飞 | `[FAST_LIO_TIMING]` 显示 IMU 数量少或 gap 大；`[FAST_LIO_GUARD]` 连续 rejected | 转弯期间 IMU 丢样/去畸变下降；旧版坏更新会污染地图，严格 guard 又可能在纯 IMU 漂远后永久锁死 | 检查 QoS/队列/timing；被拒帧不得写图。连续拒帧后只允许高置信 `state-only recovery`，该帧不写地图，下一严格好帧才 recovered |
+| **导航快速转弯后 ICP 跳飞** | map→odom 瞬间发生大平移或大旋转 | 日志出现 `Rejecting ICP jump/quality`，或旧版同一帧被重复确认 | 旧实现频率单位反了、可重复处理陈旧点云、`/initialpose` 方向错误且缺少并发版本保护 | 使用真实 4 Hz、scan generation 去重、两份不同窗口确认、1 m/15° gate、正确 `map_T_odom` 和 stale ICP 丢弃 |
 | **鬼影/重影** | 同一面墙出现多层影子 | 转弯阶段点云错位最明显 | 急转、上述 IMU/外参错误，或 LiDAR–IMU 时间偏差 | 先修正确定性配置，再慢转复测；若仍存在，记录 rosbag 检查时间同步 |
 | **盲区/空洞** | 地图有大片未知区域 | `grid` 在该区域无覆盖 | 没走到或有效特征不足 | 驱动 G1 覆盖所有区域，在关键位置短暂停留 |
 | **2D 栅格噪点** | 墙壁中间有随机黑白斑点 | N/A | 雷达噪点或行人经过 | 用下方 Map Editor 手动擦除 |
@@ -580,7 +589,7 @@ default_grid_yaml = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'floor1
 ```bash
 cd /data/unitree/botbrain_ws
 docker compose restart localization
-# 确认新地图加载：看 fitness > 0.9
+# 确认新地图加载：看 `ICP: accepted=true`，当前门限 fitness>=0.50 且 rmse<=0.30
 ```
 
 ---
@@ -602,7 +611,7 @@ docker compose up fast_lio localization
 **初始位姿对齐：**
 - 当前位置与建图起始位姿一致 → 无需操作
 - 偏差 > 1m 或 > 90° → Foxglove 发送 `/initialpose` 指定机器人在地图上的位置
-- localization 日志 `reg_result.fitness > 0.9` 即 ICP 匹配完成
+- localization 日志出现 `ICP: accepted=true`，且 fitness/RMSE 通过当前质量门，才表示本帧 ICP 已真正写入 map→odom
 
 ### 5.2 启动导航
 
@@ -644,7 +653,7 @@ ros2 run bot_navigation localization_monitor.py              # 漂移监控
 |------|---------|---------|
 | `bringup`（雷达驱动） | 硬件握手 **5~10s** | `livox/lidar publish use livox custom format` |
 | `fast_lio` | **sleep 25s** | `[MAP] frame=X feats_down=XX` |
-| `localization` | **sleep 30s** | `reg_result.fitness > 0.9` |
+| `localization` | **sleep 30s** | 初始化成功，随后出现 `ICP: accepted=true` |
 | `navigation` | **sleep 30s** | Nav2 lifecycle 全部 active |
 
 > bringup 刚起来时 fast_lio 打印 `No Effective Points!` 属正常，等雷达就绪后自动恢复。超过 30s 仍无点云再排查。
@@ -653,7 +662,7 @@ ros2 run bot_navigation localization_monitor.py              # 漂移监控
 1. ✅ bringup 出现 `livox custom format` → 雷达就绪
 2. ✅ fast_lio 出现 `[MAP] frame=X` → 里程计就绪
 3. ⚠️ `target size: 0` 不会自动恢复 → Foxglove 发送 `/initialpose`
-4. ✅ localization 出现 `fitness > 0.9` → ICP 收敛，定位可信
+4. ✅ localization 出现可信 fitness，且日志确认 `ICP 4.00 Hz (250.0 ms)` → ICP 收敛；跳变帧应被 1 m/15° 门限拒绝
 5. ✅ 再启动 navigation
 
 **启动导航服务(想要开导航就需要开启建图定位)**
@@ -749,3 +758,254 @@ docker compose stop fast_lio && docker compose up -d fast_lio
 请分析这个工程的各子工程内容，只分析定位建图功能，botbrain_project-main为主工程，g1_3d_nav_ros2 为副工程（包含了需要的定位建图模块功能），FAST_LIO_LOCALIZATION_HUMANOID 为副工程的原工程，现在我做了副工程的定位建图功能移植到main主工程，但是目前移植后的效果不理想，建图容易产生漂移，现在需要你来帮我重新移植，不过这次移植的是副工程的源工程，需要你把我移植的那部分全部换成源工程，但是最后的启动方式不变，还是使用docker compose启动。借于上次的移植，发现有很多问题，其一就是话题名称类，这次考虑定位建图不使用命名空间，以源工程默认即可；其二是启动的文件后，雷达数据类型等等不一致，需要改成启动bringup服务时，不启动雷达，雷达由fastlio服务启动。我需要你完整的替换，不保留原来main工程里的定位建图内容，目的是能稳定跑通代码，原先每次启动定位建图都需要启动bringup来启动雷达，而这次我需要由fastlio服务来启动雷达，或者将bringup启动的雷达数据类型和各种参数配置与FAST_LIO_LOCALIZATION_HUMANOID启动雷达时的各种配置保持一致，就可以直接使用bringup服务来启动。之前在main工程移植里修改过docker-compose.yaml、 src/fast_lio、 src/open3d_loc、 src/g1_pkg 的内容，所以现在的源工程内容与main工程里该内容是不一致的，需要你多加考虑，并且我是通过远程开发连接到G1机器人上，所以本机没有运行这些程序的环境，你只需要修改即可。
 ```
 
+
+
+---
+
+## 追加：转弯后再移动漂移的第三轮修正与验收（2026-07-12）
+
+本轮修正针对的不是 Foxglove 显示问题，而是“旋转后短暂稳定，再次移动时状态或 map→odom 突然跳飞”的恢复链路。
+
+### 1. FAST-LIO：连续拒帧后的 state-only recovery
+
+严格 guard 拒绝坏 LiDAR 更新时，仍然会保留 IMU 预测，但如果连续很多帧都被拒绝，纯 IMU 状态会逐渐离开真实位置；此时后续正确的 LiDAR correction 可能因为修正量超过普通门限而继续被拒绝，形成永久锁死。
+
+当前增加高置信恢复条件：
+
+| 参数 | 当前值 | 含义 |
+|---|---:|---|
+| `mapping.guard_recovery_min_rejections` | 5 | 至少连续拒绝 5 个候选后才允许恢复 |
+| `mapping.guard_recovery_min_effective_ratio` | 0.10 | 恢复帧必须有更高有效点比例 |
+| `mapping.guard_recovery_max_residual` | 0.15 m | 恢复帧 residual 必须比普通 guard 更严格 |
+| `mapping.guard_recovery_max_translation_correction` | 1.50 m | 只对恢复候选放宽平移修正量 |
+| `mapping.guard_recovery_max_rotation_correction_deg` | 45° | 只对恢复候选放宽旋转修正量 |
+
+满足条件时日志为：
+
+`[FAST_LIO_GUARD] state-only recovery on guarded candidate N`
+
+该帧只把高置信 LiDAR correction 写回 EKF 状态，**故意跳过 `map_incremental()`**，因此不会写 ikd-tree，也不会写入待保存 PCD。下一份点云仍必须重新通过普通严格 guard，地图写入才恢复。这样可以同时避免“永远拒帧锁死”和“用放宽门限的恢复帧污染地图”。
+
+IMU propagation 前后也会检查状态与 covariance 是否 finite；传播后出现 NaN/Inf 时恢复传播前状态并跳过当前 scan/map insertion。
+
+### 2. Open3D：每次 ICP 必须使用新的世界点云窗口
+
+定位线程以前由里程计时间戳驱动。当里程计持续更新但 LiDAR 没有新帧时，同一个旧点云窗口可能被重复执行 ICP；原本的“两次一致确认”可能只是同一份数据算了两遍，属于伪确认。
+
+当前通过 `scan_generation_` 修正：
+
+- `CallbackScan()` 每收到并聚合一份新点云窗口，generation 加一；
+- 初始化 ICP 和正常定位 ICP 都记录最后处理的 generation；
+- generation 未变化时不重复 ICP，且正常定位置信度发布为 0；
+- 中等 correction 的两次确认必须来自两个不同 incoming cloud window；
+- `large_correction_confirmations: 1` 时，第一份满足质量门的新点云仍可直接接受。
+
+### 3. Open3D：强制检查点云必须是 `camera_init` 世界坐标
+
+新增参数：
+
+`registered_cloud_world_frame: camera_init`
+
+`cloud_registered_1` 的 `header.frame_id` 不等于该参数时，Open3D 会拒绝点云并输出：
+
+`Rejecting cloud_registered_1 frame '...': Open3D requires world-frame cloud 'camera_init'`
+
+这是防止误把 `/cloud_registered_body_1` 或其他机器人随动坐标点云接入 ICP。算法的 source crop、初值和 map→odom 计算都假定输入点已经在 FAST-LIO 世界坐标中；body-frame 点云若混入，会直接制造“点云随机器人转、ICP 又尝试把它对地图”的灾难性错误。
+
+Foxglove 仍使用：
+
+- Fixed Frame = `camera_init`
+- Display/Follow Frame = `camera_init`
+- 世界地图观察 = `/cloud_registered_1`
+- 不用 `/cloud_registered_body_1` 判断地图是否稳定
+
+### 4. `/initialpose` 与运行中 ICP 的并发保护
+
+`/initialpose` 表示的是 `map_T_base`，必须转换为：
+
+`map_T_odom = map_T_base * inverse(odom_T_base)`
+
+不能直接把 `map_T_base` 当作 `map_T_odom`。当前回调会同时更新 map→odom、派生 base→map、Kalman 基准，并增加 `manual_pose_generation_`。
+
+若用户发送 `/initialpose` 时 ICP 正在计算，旧 snapshot 算出的 ICP 结果会因 generation 不一致而被丢弃，日志为：
+
+- `LocalizationInitialize: discarding stale ICP result after manual relocalization`
+- `Discarding stale ICP result after manual relocalization`
+
+这样旧 ICP 不会覆盖刚设置的人工重定位。
+
+### 5. 初始化阶段不再允许低质量 ICP 逐轮带偏
+
+有效最低初始化 fitness 被夹紧为不低于 `threshold_fitness_init`。当前两者均为 0.50：
+
+- `threshold_fitness_init: 0.50`
+- `min_initialization_fitness: 0.50`
+
+只有同时通过 fitness、RMSE、单次平移/旋转门限的 candidate 才能更新 map→odom，并且初始化成功需要两个不同点云 generation 连续通过。低质量结果只记录拒绝，不再一轮轮修改初始位姿。
+
+### 6. 真机测试时必须观察的日志
+
+FAST-LIO：
+
+- `[FAST_LIO_TIMING]`
+- `[FAST_LIO_GUARD] rejected=...`
+- `[FAST_LIO_GUARD] state-only recovery on guarded candidate ...`
+- `[FAST_LIO_GUARD] recovered after ...`
+
+Open3D：
+
+- `ICP 4.00 Hz (250.0 ms), ...`
+- `ICP: accepted=true/false fitness=... rmse=... correction=...`
+- `Holding large ICP correction ... (1/2)`
+- `Rejecting ICP jump`
+- `Rejecting ICP quality`
+- `Manual pose reset detected`
+- `Discarding stale ICP result after manual relocalization`
+- 不应出现世界点云 frame 拒绝；若出现，先修正 topic/frame，不要放宽 ICP 门限
+
+推荐验收路线：静止等待 `IMU Initial Done` → 慢速左右转 → 90° 转弯后停稳 → 再前进 1 m → 逐步提高转弯速度。出现跳变时保存完整 FAST-LIO timing/guard 和 Open3D ICP 日志，不要只截 Foxglove 图片。
+
+## 追加：转弯后再移动漂移的第四轮修正与验收（2026-07-12）
+
+本轮继续修复了 4 条会造成“先积累、后突然跳飞”的真实数据路径：
+
+1. **Open3D 不再聚合 5 帧世界点云**：`pcd_queue_maxsize=1`，只用最新 `/cloud_registered_1`。FAST-LIO 急转时如果连续世界云互相有误差，历史聚合会形成双墙/重影，ICP 不能再把它当成一个刚体 source。
+2. **初始化不再逐帧写 map->odom**：第一份初始化 ICP 只 pending；第二个独立 scan 必须在 `0.20 m / 4 deg` 内给出相同绝对候选，且间隔不超过 `1.0 s`，确认后才一次性提交。
+3. **正常 ICP 候选有 1 秒寿命**：旧候选不能跨点云断流、长阻塞或暂停后继续完成 `2/2` 确认。
+4. **FAST-LIO 空 IMU 不再重放上一帧云**：`ImuProcess::Process()` 每帧先清空复用输出。空 IMU/初始化 early return 后，当前 scan 会被跳过，不会把上一帧点云按新时间再次匹配、写图。
+5. **LiDAR 时间回跳同步清理两个队列**：`lidar_buffer`、`time_buffer` 和 `lidar_pushed` 一起复位，避免点云与时间戳索引错位。
+
+G1 当前关键参数：
+
+```yaml
+pcd_queue_maxsize: 1
+immediate_icp_translation_step: 0.10
+immediate_icp_rotation_step_deg: 2.0
+large_correction_confirmations: 2
+icp_candidate_consistency_translation: 0.20
+icp_candidate_consistency_rotation_deg: 4.0
+icp_candidate_max_age_sec: 1.0
+max_icp_translation_step: 1.0
+max_icp_rotation_step_deg: 15.0
+```
+
+启动日志应包含：
+
+```text
+ICP 4.00 Hz (250.0 ms), queue=1, ... immediate<=0.10m/2.0deg, ... confirmations=2 within 1.00s
+```
+
+初始化必须先看到：
+
+```text
+LocalizationInitialize: holding consistent candidate (1/2)
+```
+
+再看到：
+
+```text
+Localization initialization succeeded: ... consistent confirmations=2
+```
+
+真机测试按“静止 10 秒 → 直行 → 慢转 90 度 → 停 3 秒 → 再直行 → 逐步提高转速”执行。若单帧 source 长期少于 100 点，可把队列临时调为 2；不要直接恢复 5。若 `/Odometry_loc` 在 Open3D 修正之前已经跳变，继续检查 `[FAST_LIO_TIMING]`、`[FAST_LIO_GUARD]`、IMU 翻转、外参和硬件时间同步。
+
+完整根因、代码路径和验证边界见：`FAST_LIO转弯后不可恢复漂移第二阶段分析与解决报告.md` 的第 13 节。
+### 第四轮补充：IMU 去畸变内部状态初始化与完整回滚
+
+进一步确认 `ImuProcess` 的 `acc_s_last`、`last_lidar_end_time_` 原来没有初始化，却在第一帧正式去畸变时直接参与 pose 和 `dt` 计算。现已在构造与 `Reset()` 中固定为 `Zero3d` 和 `-1.0`。
+
+同时新增 `PropagationCheckpoint`。若 IMU propagation 后出现 NaN/Inf，不仅恢复 EKF state/covariance，还会恢复 `last_imu_`、上一角速度/加速度、上一 LiDAR 结束时间并清空本帧云，避免“EKF 已回滚但 IMU 内部时间线仍向前”的半回滚状态。
+
+## 追加：第五轮转弯漂移修正与真机验收（2026-07-12）
+
+本轮又定位到一个会在转弯时放大的确定性竞态：FAST-LIO 先发布 `/Odometry_loc`，再发布同一帧的 `/cloud_registered_1`；旧 Open3D 线程可能在两次 publish 之间醒来，提前消耗新里程计，却仍拿到旧点云，随后形成“点云 N + 里程计 N+1”的错配。直行时不明显，转弯时会直接制造错误 ICP correction。
+
+现在 Open3D 由新点云 generation 驱动，并要求点云与里程计 stamp 一致：
+
+```yaml
+pcd_queue_maxsize: 1
+max_scan_odom_time_skew_sec: 0.03
+```
+
+启动日志应包含：
+
+```text
+ICP 4.00 Hz (250.0 ms), queue=1, ... stamp_skew<=0.030s ...
+```
+
+若出现以下日志，Open3D 会等待同帧数据，不会提交 ICP：
+
+```text
+Skipping ICP until cloud/odometry stamps match (...)
+LocalizationInitialize: waiting for matching cloud/odometry stamps (...)
+```
+
+### FAST-LIO 当前严格写图条件
+
+`mid360.yaml` 当前关键值：
+
+```yaml
+guard_min_effective_points: 100
+guard_min_effective_ratio: 0.10
+guard_max_residual: 0.15
+guard_max_translation_correction: 0.25
+guard_max_rotation_correction_deg: 5.0
+guard_recovery_min_rejections: 5
+guard_recovery_min_effective_ratio: 0.15
+guard_recovery_max_residual: 0.10
+guard_recovery_max_translation_correction: 0.75
+guard_recovery_max_rotation_correction_deg: 15.0
+```
+
+同时每帧必须满足 timing：
+
+- IMU 数量不少于 5；
+- 最大 IMU gap 不超过 0.02 秒（包含前后 LiDAR 帧边界）；
+- scan 时长 0.05~0.15 秒；
+- scan 末端与最后 IMU 间隔不超过 0.03 秒。
+
+`[FAST_LIO_TIMING] ok=false` 的帧允许 IMU 状态时间线继续前进，但不能初始化/更新 ikd-tree，也不能 state-only recovery。
+
+### rejected/recovery 时 Foxglove 的预期表现
+
+- rejected 或 state-only recovery 帧不再发布 `/cloud_registered_1`；
+- 因此 Foxglove 世界点云会短暂停在上一份可信帧，而不是跟随错误预测旋转；
+- `/Odometry_loc` 仍可连续发布 IMU prediction；
+- `/cloud_registered_body_1` 可继续用于查看原始 body-frame 点云；
+- 下一帧同时通过 timing、有效点、residual 和 correction 严格门后，世界点云恢复刷新。
+
+不要把“拒帧期间世界云暂停刷新”误判为 topic 断流，这是有意的安全隔离。若需要确认，联合查看：
+
+```text
+[FAST_LIO_TIMING]
+[FAST_LIO_GUARD]
+/cloud_registered_body_1
+```
+
+### 第五轮标准测试路线
+
+1. 启动后机器人严格静止至少 10 秒，等待 `IMU Initial Done`。
+2. 直行 1~2 米，确认 `timing=true`，guard 基本 accepted。
+3. 慢速左转 90 度，停止 3 秒，再直行 1 米。
+4. 慢速右转 90 度，停止 3 秒，再直行 1 米。
+5. 逐步提高转速，不要第一轮直接急转。
+6. 同时录制：
+
+```bash
+ros2 bag record /livox/imu /livox/lidar /Odometry_loc /cloud_registered_1 /cloud_registered_body_1
+```
+
+7. 若仍发生跳飞，必须保存跳飞前后至少 10 秒的：
+   - `[FAST_LIO_TIMING]`；
+   - `[FAST_LIO_GUARD]`；
+   - Open3D fitness/rmse/correction；
+   - cloud/odom stamp mismatch 日志。
+
+### 验收判断
+
+- **通过**：急转坏帧被拒绝，地图/世界云不被污染；恢复后无需重启服务即可继续 accepted 和建图/导航。
+- **仍是时序问题**：频繁 `timing=false` 或 stamp mismatch；先修 DDS/CPU/驱动/时间同步，不能放宽 ICP 大跳门。
+- **仍是 IMU/外参问题**：timing 一直正常，但每次同方向转弯都出现相似 correction；验证 `imu_flip_yz` 的重力/yaw 符号，并标定 `time_offset_lidar_to_imu` 与 LiDAR-IMU 外参。
+- **走廊不可观测**：fitness 较高但沿走廊方向缓慢累计；需要回环、视觉、标志物或机器人里程计等额外约束，纯 ICP gate 只能防突然跳飞。
+
+完整代码根因和修复链见 `FAST_LIO转弯后不可恢复漂移第二阶段分析与解决报告.md` 第 14 节。
