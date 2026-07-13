@@ -49,13 +49,15 @@ def generate_launch_description():
                 # known body-to-floor height and must pass quality gates.
                 '--ground-z-min',   '-1.35',
                 '--ground-z',       '-1.15',
-                '--obstacle-z',     '-1.10',
+                '--obstacle-z',     '-1.14',
                 '--obstacle-z-max', '0.35',
                 '--skip-frames',    '60',    # FAST-LIO warmup
                 '--sensor-height',  '1.247',
                 '--below-ground-tolerance', '0.10',
                 '--ground-margin',          '0.08',
-                '--obstacle-margin',        '0.15',
+                # Keep a small 2 cm dead band above the 8 cm floor band. This
+                # recovers low furniture/boxes without classifying floor noise.
+                '--obstacle-margin',        '0.10',
                 # Navigation only needs the lower wall/furniture band. Keeping
                 # this below normal ceiling height prevents a ceiling plane
                 # from being projected into a solid black floor region.
@@ -71,8 +73,18 @@ def generate_launch_description():
                 '--self-y-abs',     '0.40',
                 '--self-z-min',     '-1.35',
                 '--self-z-max',     '0.15',
-                '--raytrace-range', '15.0',
-                '--raytrace-bins',  '360',
+                # Point-by-point free-space generation is intentionally used
+                # for saved-map editing. Ray clearing remains available as an
+                # opt-in diagnostic but otherwise over-whitens the map.
+                '--no-raytrace',
+                # One-cell metric support keeps sparse walls connected without
+                # turning each return into the previous full 3x3 black block.
+                '--obstacle-spread-radius', '0.05',
+                # Ground support uses a weaker update. After a person leaves,
+                # repeated floor returns clear the transient footprint while
+                # continuously observed walls and furniture remain occupied.
+                '--free-spread-radius',     '0.05',
+                '--free-update',            '0.30',
                 '--min-obs-hits',   '3',     # distinct accepted scan frames
                 '--debug-clouds',            # ground/obstacle/self diagnostics
                 '--map-z',          '-1.247', # fallback display height before plane fit
