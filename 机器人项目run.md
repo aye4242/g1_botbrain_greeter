@@ -239,6 +239,7 @@ docker compose up fast_lio
 
 # 机器人保持完全静止，必须看到初始化完成后才能移动
 docker logs g1_robot_fast_lio 2>&1 | grep "IMU Initial"
+docker logs -f g1_robot_fast_lio 2>&1 | grep -E "IMU Initial|imu_flip|mean_acc"
 ```
 
 在另一个终端确认原始 IMU和世界点云都在持续发布（每条 `hz` 命令单独运行，观察后按 Ctrl+C）：
