@@ -44,4 +44,28 @@ def test_localization_service_starts_the_installed_launch_file_directly():
 def test_fast_lio_service_execs_launch_for_graceful_map_save_shutdown():
     source = _read("docker-compose.yaml")
 
-    assert "exec ros2 launch g1_pkg fast_lio.launch.py" in source
+    assert "exec ros2 launch --noninteractive g1_pkg fast_lio.launch.py" in source
+    assert "stop_signal: SIGINT" in source
+    assert "stop_grace_period: 180s" in source
+
+
+def test_fast_lio_launch_allows_large_pcd_flush_before_signal_escalation():
+    source = _read("botbrain_ws/src/g1_pkg/launch/fast_lio.launch.py")
+
+    assert "sigterm_timeout='150'" in source
+    assert "sigkill_timeout='20'" in source
+
+
+def test_pcd_service_and_exit_share_the_validated_map_save_path():
+    source = _read("botbrain_ws/src/fast_lio/src/laserMapping.cpp")
+
+    assert "bool save_to_pcd(std::string &message)" in source
+    assert "const std::size_t point_count = pcl_wait_save->size();" in source
+    assert "pcd_writer.writeBinary(temporary_path, *pcl_wait_save)" in source
+    assert "res->success = save_to_pcd(res->message);" in source
+    assert "*pcl_wait_save += *feats_down_world;" in source
+    assert "last_saved_point_count = point_count;" in source
+    assert "pcl_wait_save->size() != last_saved_point_count" in source
+    assert "ikdtree.stop_thread();" not in source
+    assert "signal(SIGINT" not in source
+    assert "signal(SIGTERM" not in source

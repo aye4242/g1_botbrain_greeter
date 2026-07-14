@@ -188,6 +188,9 @@ docker compose stop navigation localization fast_lio
 stamp=$(date +%Y%m%d_%H%M%S)
 cp -a botbrain_ws/src/g1_pkg/maps \
       "botbrain_ws/src/g1_pkg/maps_backup_$stamp"
+
+# 后续用此时间标记排除误把旧 PCD 当成本次保存结果
+touch botbrain_ws/src/g1_pkg/maps/.floor1_mapping_started
 ```
 
 建图期间不得启动 `localization` 和 `navigation`。它们分别维护全局定位和导航 TF，和建图同时运行会让排障变得不可控。
@@ -248,7 +251,7 @@ docker compose up -d fast_lio
 
 # 机器人必须保持静止，直到 IMU 初始化完成
 docker compose logs -f fast_lio | \
-  grep -E "IMU Initial|FAST-LIO input|FAST_LIO_TIMING|FAST_LIO_GUARD"
+  grep -E "IMU Initial|FAST-LIO input|FAST_LIO_PCD|FAST_LIO_TIMING|FAST_LIO_GUARD"
 ```
 
 另开终端逐项检查，每条 `hz` 命令观察后按 `Ctrl+C`：
@@ -267,6 +270,7 @@ exit
 必须满足：
 
 - 启动日志包含 `imu=/livox/imu flip_yz=true imu_q=2000 lidar_q=100 guard=true`。
+- 启动日志包含 `[FAST_LIO_PCD] enabled=true path=<目标 PCD> interval=-1`；这里显示的是 `install/` 中实际生效的配置。
 - 看到 `IMU Initial Done` 后才能移动。
 - `[FAST_LIO_TIMING] ok=true` 应稳定出现；通常 `imu_count>=5`、`max_gap<=0.02s`、扫描末端 IMU 差不超过 `0.03s`。
 - 偶发 guard rejected 可以接受，但坏帧不得写地图；后续应能看到 recovered 或恢复正常世界点云刷新。
@@ -291,7 +295,7 @@ Foxglove/RViz2 设置：
 
 正式建图建议线速度不超过 `0.3 m/s`、角速度不超过 `0.2 rad/s`。门框、拐角和未来 waypoint 区域尽量从两个方向采集，并在关键位置停留 3～5 秒。当前 FAST-LIO 没有全局回环，返回起点只能检查误差，不能自动修改已经写入的历史地图。
 
-### 步骤 4：先保存 2D 栅格，再正常停止 FAST-LIO 保存 PCD
+### 步骤 4：先保存 2D 栅格，再主动保存 PCD，最后停止 FAST-LIO
 
 保存 2D 栅格快照：
 
@@ -304,18 +308,60 @@ ros2 topic info /accumulated_grid
 ros2 run nav2_map_server map_saver_cli \
   -t /accumulated_grid --free 0.196 --occ 0.65 \
   -f /botbrain_ws/src/g1_pkg/maps/floor1
+
+# 确认节点实际启用了 PCD 保存，而且目标路径与本场景一致
+ros2 param get /fast_lio pcd_save.pcd_save_en
+ros2 param get /fast_lio map_file_path
+ros2 service list | grep '^/map_save$'
+
+# 机器人保持静止；服务返回 success=true 后 PCD 已经写盘
+ros2 service call /map_save std_srvs/srv/Trigger '{}'
 exit
 ```
 
-随后在机器人宿主机正常停止整个 FAST-LIO 服务。节点会在退出路径中把 PCD 写到 `map_file_path`；不要只杀节点后让 `restart: always` 重新拉起一个新建图进程。
+先在机器人宿主机验证主动保存生成的文件。主动调用 `/map_save` 是正式保存路径，不能把唯一一次保存机会押在容器退出信号上：
+
+```bash
+maps=/data/unitree/botbrain_ws/botbrain_ws/src/g1_pkg/maps
+marker="$maps/.floor1_mapping_started"
+test -f "$marker"
+test -s "$maps/floor1_scans.pcd"
+test "$maps/floor1_scans.pcd" -nt "$marker"
+head -n 11 "$maps/floor1_scans.pcd" | \
+  grep -E "^(FIELDS|WIDTH|HEIGHT|POINTS|DATA)"
+```
+
+只有服务返回 `success=true`、消息包含 `saved <点数> points to <目标文件>`，并且上面的文件检查通过，才继续停止 FAST-LIO。停止信号保存现在只是异常情况下的兜底；不要只杀节点后让 `restart: always` 重新拉起一个新建图进程。
 
 ```bash
 cd /data/unitree/botbrain_ws
-docker compose stop -t 120 fast_lio
+docker compose stop -t 180 fast_lio
 
-# 必须看到 saving <点数> points to <目标文件>
-docker compose logs --tail 120 fast_lio | \
-  grep -E "catch sig|saving [0-9]+ points|WARNING: pcl_wait_save"
+# 查看主动保存和停止过程；不要在停止前查退出日志
+docker compose logs --since 15m --timestamps fast_lio | \
+  grep -E "FAST_LIO_PCD|saving [0-9]+ points|saved [0-9]+ points|PCD save skipped|PCL writeBinary|sending signal.*SIGINT|finished cleanly|failed to terminate|SIGKILL"
+```
+
+若 `/map_save` 不存在、参数显示 `false`，或者目标仍是旧的 `scans.pcd`，说明机器人运行的 `install/` 或容器还是旧版本。该次建图不能按正式流程验收；保存日志后停止旧进程，重新 build/recreate，再重新建图：
+
+```bash
+cd /data/unitree/botbrain_ws
+sha256sum botbrain_ws/src/fast_lio/config/mid360.yaml \
+          botbrain_ws/install/fast_lio/share/fast_lio/config/mid360.yaml
+sha256sum botbrain_ws/src/g1_pkg/launch/fast_lio.launch.py \
+          botbrain_ws/install/g1_pkg/share/g1_pkg/launch/fast_lio.launch.py
+
+docker inspect g1_robot_fast_lio --format 'cmd={{json .Config.Cmd}} stop={{json .Config.StopSignal}}'
+docker compose stop fast_lio
+docker compose rm -f fast_lio
+
+docker compose run --rm builder_base bash -lc '
+  source /opt/ros/humble/setup.bash
+  cd /botbrain_ws
+  colcon build --packages-select fast_lio g1_pkg \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release
+'
+docker compose up -d --force-recreate fast_lio
 ```
 
 确认三个成品文件都存在：

@@ -21,7 +21,15 @@ def test_mapping_runbook_uses_current_install_and_launch_paths():
 def test_mapping_runbook_documents_safe_save_and_editor_semantics():
     source = _runbook()
 
-    assert "docker compose stop -t 120 fast_lio" in source
+    service_save = "ros2 service call /map_save std_srvs/srv/Trigger '{}'"
+    stop_fast_lio = "docker compose stop -t 180 fast_lio"
+    assert service_save in source
+    assert stop_fast_lio in source
+    assert source.index(service_save) < source.index(stop_fast_lio)
+    assert "ros2 param get /fast_lio pcd_save.pcd_save_en" in source
+    assert "ros2 param get /fast_lio map_file_path" in source
+    assert "test -s \"$maps/floor1_scans.pcd\"" in source
+    assert "test \"$maps/floor1_scans.pcd\" -nt \"$marker\"" in source
     assert "左键**画黑" in source
     assert "右键**画白" in source
     assert "当前不会影响 Nav2" in source
