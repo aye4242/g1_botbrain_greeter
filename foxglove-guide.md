@@ -101,7 +101,7 @@
 2. 固定参考系改为 `map`
 
 ### 机器人显示在地图下方
-先确认 Fixed Frame 是 `map`，不是 `camera_init`。成品 PCD 的地面已经校正到 `map z≈0`，定位节点会固定 `map -> odom.z≈+1.247m`，将实时点云地面从 `camera_init z≈-1.247m` 对齐到 `map z≈0`。
+先确认 Fixed Frame 是 `map`，不是 `camera_init`。成品 PCD 的地面已经校正到 `map z≈0`，定位节点会固定 `map -> odom.z≈+1.247m`，并将 `map -> odom` 的 roll/pitch 约束为零，只允许 ICP 修正平面 `x/y/yaw`。
 
 不要再手工给 `/map` 设置 `-1.247` 的显示偏移。应检查：
 
@@ -110,11 +110,14 @@ docker exec -it g1_robot_localization bash -lc '
   source /opt/ros/humble/setup.bash
   source /botbrain_ws/install/setup.bash
   ros2 topic echo --once /odom2map --field pose.pose.position
-  ros2 run tf2_ros tf2_echo map camera_init
+  timeout 3 ros2 run tf2_ros tf2_echo map camera_init || true
+  timeout 3 ros2 run tf2_ros tf2_echo map g1_robot/base_footprint || true
 '
 ```
 
-两者的 Z 都应约为 `+1.247`。若数值正确但在 `camera_init` Fixed Frame 下红色 `/pcd_map` 仍偏高，这是其启动时旧时间戳造成的显示现象，切换到 `map` 即可。
+`/odom2map` 和 `map -> camera_init` 的 Z 都应约为 `+1.247`；`map -> g1_robot/base_footprint` 的 Z 和 Roll/Pitch 应接近零。定位日志应持续显示 `map_odom_rp=0.00/0.00 deg`。若数值正确但在 `camera_init` Fixed Frame 下红色 `/pcd_map` 仍偏高，这是其启动时旧时间戳造成的显示现象，切换到 `map` 即可。
+
+高度检查时只显示 `/pcd_map`、`/cloud_registered_1` 和 `/map`，且 PointCloud Decay 设为 `0`。`/cloud_registered_body_1`、`/cloud_effected_1` 和 FAST-LIO `/path_1` 分别是当前局部扫描、诊断点和位于 IMU 高度的轨迹，不用来判定地面高度。
 
 ### Schema 不匹配警告（`/scan`、`/livox/lidar`）
 不影响功能，忽略即可。如需消除，从 `foxglove_bridge_params.yaml` 白名单删掉 `/scan`。
