@@ -84,11 +84,12 @@ The **BotBrain Workspace** is a modular, open-source ROS2 framework for autonomo
 For containerized deployment:
 
 ```bash
-# Start all services
+# Start default-profile services (localization/navigation excluded)
 docker compose up -d
 
-# Start specific services
-docker compose up -d state_machine bringup localization navigation
+# Start the navigation stack
+docker compose --profile navigation up -d \
+  state_machine bringup foxglove fast_lio localization navigation
 
 # View logs
 docker compose logs -f bringup
@@ -413,14 +414,21 @@ The workspace includes multiple Docker services for containerized deployment:
 | `rosa` | AI tool calling services | Yes | bringup |
 | `yolo` | Object detection service | Yes | bringup |
 
+`Auto-start` describes restart behavior after a container has been created.
+`localization` and `navigation` are in the `navigation` Compose profile, so a
+plain `docker compose up -d` does not create or start them. Compose does not
+automatically start the logical localization dependency when only `navigation`
+is named; start the navigation stack explicitly as shown below.
+
 ### Docker Usage
 
 ```bash
-# Start all services
+# Start default-profile services (localization/navigation excluded)
 docker compose up -d
 
-# Start specific service with dependencies
-docker compose up -d navigation  # Automatically starts bringup, localization
+# Start the navigation stack explicitly
+docker compose --profile navigation up -d \
+  state_machine bringup foxglove fast_lio localization navigation
 
 # View logs
 docker compose logs -f bringup
@@ -431,6 +439,9 @@ docker compose down
 # Rebuild after code changes
 docker compose build
 docker compose up -d
+
+# Refresh navigation-profile services when needed
+docker compose --profile navigation up -d fast_lio localization navigation
 ```
 
 ## Configuration

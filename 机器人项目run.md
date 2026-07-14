@@ -184,6 +184,12 @@ ros2 launch g1_manipulation_pkg manipulation_launcher.launch.py interface:=enP8p
 cd /data/unitree/botbrain_ws
 docker compose stop navigation localization fast_lio
 
+if docker compose ps --services --filter status=running | \
+     grep -Eq '^(localization|navigation)$'; then
+  echo "ERROR: 建图时 localization/navigation 必须停止"
+  exit 1
+fi
+
 # 可选：建图前备份当前活动地图
 stamp=$(date +%Y%m%d_%H%M%S)
 cp -a botbrain_ws/src/g1_pkg/maps \
@@ -193,7 +199,7 @@ cp -a botbrain_ws/src/g1_pkg/maps \
 touch botbrain_ws/src/g1_pkg/maps/.floor1_mapping_started
 ```
 
-建图期间不得启动 `localization` 和 `navigation`。它们分别维护全局定位和导航 TF，和建图同时运行会让排障变得不可控。
+建图期间不得启动 `localization` 和 `navigation`。它们分别运行 Open3D ICP、地图服务、Nav2 和全局 TF；同时建图会争抢 CPU，并把旧地图的 `/scan`、`/submap`、`/pcd_map` 和 TF 叠加到新地图上，视觉上很像 FAST-LIO 再次漂移。Compose 已把这两个服务放入 `navigation` profile，普通 `docker compose up -d` 不会自动启动它们；文档中的显式服务启动命令仍然有效。
 
 ### 步骤 1：配置 PCD 输出并开启保存
 
@@ -218,6 +224,9 @@ touch botbrain_ws/src/g1_pkg/maps/.floor1_mapping_started
       extrinsic_est_en: false
       extrinsic_T: [-0.011, -0.02329, 0.04412]
 
+    publish:
+      map_en: false
+
     pcd_save:
       pcd_save_en: true
 ```
@@ -241,7 +250,8 @@ docker compose run --rm builder_base bash -lc '
 ```bash
 cd /data/unitree/botbrain_ws
 
-# 后台启动基础服务
+# 后台启动基础服务；重启 foxglove 使新的话题白名单生效
+docker compose stop localization navigation foxglove
 docker compose up -d bringup state_machine foxglove
 
 # 重新创建，确保使用新 install 和新参数
@@ -264,15 +274,18 @@ ros2 topic hz /livox/imu
 ros2 topic info -v /livox/imu
 ros2 topic hz /cloud_registered_1
 ros2 topic hz /Odometry_loc
+ros2 topic info -v /cloud_registered_1
+ros2 topic info -v /Odometry_loc
 exit
 ```
 
 必须满足：
 
 - 启动日志包含 `imu=/livox/imu flip_yz=true imu_q=2000 lidar_q=100 guard=true`。
-- 启动日志包含 `[FAST_LIO_PCD] enabled=true path=<目标 PCD> interval=-1`；这里显示的是 `install/` 中实际生效的配置。
+- 启动日志包含 `[FAST_LIO_PCD] enabled=true path=<目标 PCD> interval=-1 laser_map=false`；这里显示的是 `install/` 中实际生效的配置。
 - 看到 `IMU Initial Done` 后才能移动。
 - `[FAST_LIO_TIMING] ok=true` 应稳定出现；通常 `imu_count>=5`、`max_gap<=0.02s`、扫描末端 IMU 差不超过 `0.03s`。
+- `/cloud_registered_1` 和 `/Odometry_loc` 必须各自只有一个 publisher；多个 FAST-LIO 实例会直接形成重影和相互冲突的 TF。
 - 偶发 guard rejected 可以接受，但坏帧不得写地图；后续应能看到 recovered 或恢复正常世界点云刷新。
 - 开启保存时 `[MAP] frame=100, 200...` 与 `pcl_wait_save` 应持续增长。
 
@@ -282,8 +295,11 @@ Foxglove/RViz2 设置：
 
 - Fixed Frame：`camera_init`。
 - Display/Follow Frame：`camera_init`。
-- 判断地图稳定性只观察 `/cloud_registered_1`。
+- 判断地图稳定性只观察 `/cloud_registered_1`，点云 Decay 设为 `0`。
 - `/cloud_registered_body_1` 随机器人运动是正常定义，不能用它判断世界地图是否漂移。
+- 建图时只叠加 `/cloud_registered_1` 和 `/accumulated_grid`；关闭 `/Laser_map_1`、`/pcd_map`、`/scan`、`/scan2map`、`/submap` 以及 local/global costmap 图层。
+
+`/Laser_map_1` 已在配置中关闭。旧实现每秒追加当前扫描并重新序列化全部历史点，消息会无限增大，而且独立定时器可能显示 guard 已拒绝的帧；它不参与当前 PCD 保存或栅格生成。
 
 先做以下小范围测试：
 
@@ -304,6 +320,8 @@ docker exec -it g1_robot_fast_lio bash
 source /opt/ros/humble/setup.bash
 source /botbrain_ws/install/setup.bash
 
+# 先停止机器人并等待最后一帧 2 Hz 栅格发布完成。
+sleep 1
 ros2 topic info /accumulated_grid
 ros2 run nav2_map_server map_saver_cli \
   -t /accumulated_grid --free 0.196 --occ 0.65 \
@@ -314,7 +332,7 @@ ros2 param get /fast_lio pcd_save.pcd_save_en
 ros2 param get /fast_lio map_file_path
 ros2 service list | grep '^/map_save$'
 
-# 机器人保持静止；服务返回 success=true 后 PCD 已经写盘
+# 机器人保持静止；保存会短暂停止实时回调。成功后不要再移动，立即验证并 stop
 ros2 service call /map_save std_srvs/srv/Trigger '{}'
 exit
 ```
