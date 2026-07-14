@@ -483,6 +483,15 @@ readlink -f scans.pcd
 readlink -f accumulated.yaml
 ```
 
+定位/导航阶段的 Foxglove 设置与建图阶段不同：
+
+- Fixed Frame：`map`。
+- Display/Follow Frame：`map` 或 `g1_robot/base_footprint`。
+- 只用 `/pcd_map`、`/cloud_registered_1` 和 `/map` 检查对齐，点云 Decay 设为 `0`。
+- 暂时关闭 `/cloud_registered_body_1`、`/cloud_effected_1`、`/scan`、`/scan2map` 和 `/submap`，避免不同用途的点云叠在一起。
+
+`camera_init` 只用于检查 FAST-LIO 自身建图是否稳定。导航时若仍以 `camera_init` 为 Fixed Frame，Foxglove 的 2D 位姿工具会把 `/initialpose` 标成 `camera_init`，定位节点将拒绝它；而启动时一次性发布的 `/pcd_map` 也可能因旧时间戳显示在错误高度，看起来像实时点云整体位于地图下方。
+
 然后重新创建定位服务：
 
 ```bash
@@ -492,16 +501,46 @@ docker compose rm -f localization fast_lio
 docker compose up -d fast_lio localization
 
 docker compose logs -f localization | \
-  grep -E "Registered cloud|ICP 4.00 Hz|LocalizationInitialize|ICP: accepted|Rejecting|Skipping ICP|Holding"
+  grep -E "Registered cloud|Map/odom height|ICP 4.00 Hz|LocalizationInitialize|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history|Holding"
 ```
 
-如果机器人没有位于建图起点附近，先通过 Foxglove `/initialpose` 给出实际位置。必须先看到：
+先确认定位节点已加载新参数：
 
 ```text
-ICP 4.00 Hz (250.0 ms), queue=1, ... stamp_skew<=0.030s ...
-Localization initialization succeeded
-ICP: accepted=true fitness=... rmse=... correction=...
+Map/odom height constraint: enabled=true z=1.247 m
+ICP 4.00 Hz (250.0 ms), cloud_queue=1, odom_history=30, ... stamp_skew<=0.030s ...
 ```
+
+如果机器人没有位于建图起点附近，此时再通过 Foxglove `/initialpose` 给出实际位置。发送后必须看到：
+
+```text
+Manual relocalization applied: requested map->base=(...), map->odom=(...)
+```
+
+随后必须继续看到：
+
+```text
+Localization initialization succeeded
+ICP: accepted=true fitness=... rmse=... correction=... map_odom_z=1.247 ...
+```
+
+若日志显示 `ignoring /initialpose in frame 'camera_init'` 或 `Rejecting initial pose in frame 'camera_init'`，说明 Foxglove Fixed Frame 仍设置错误，应改成 `map` 后重新发送。前者来自 `initialpose_z_fix`，消息会在到达 C++ 定位节点之前被拒绝。
+
+成品 PCD 已上移 `+1.247m` 时，运行中的高度关系必须满足：
+
+```bash
+docker exec -it g1_robot_localization bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /botbrain_ws/install/setup.bash
+  ros2 topic echo --once /odom2map --field pose.pose.position
+  ros2 run tf2_ros tf2_echo map camera_init
+'
+```
+
+- `/odom2map` 的 `z` 应稳定约为 `+1.247`。
+- `map -> camera_init` 的 Translation Z 应稳定约为 `+1.247`。
+- 日志中的 `map_odom_z=1.247` 应保持不变。
+- 不应再持续出现接近 `0.10s` 的 cloud/odometry mismatch；代码会从短 odom 历史中按点云时间戳查找同帧位姿，30ms 门限不得放宽。
 
 当前实际接收条件是 `fitness > 0.50`、`rmse <= 0.30m`，并同时通过点数、时间戳和 correction 门限。一般可参考：
 
@@ -604,6 +643,8 @@ bash tools/host_side/map_edit/start_map_edit.sh /root/maps/floor1.yaml
 
 RViz 弹出来后，左边是 **File Management** 面板（绿色 **Save All Files** 按钮），工具栏多了 4 个工具。
 
+> 启动命令会一直占用当前终端；完成修图并关闭 RViz 后，在终端按 `Ctrl-C` 结束 `roslaunch`，这是正常现象。脚本默认使用 Mesa 软件渲染，避免容器没有映射 `/dev/dri` 时 RViz 因 OpenGL 段错误闪退，并会隐藏不影响功能的 ROS Noetic 停止维护提醒；这些修复都不需要重建 Docker 镜像。
+
 **Step 3 — 四种编辑工具：**
 
 | 工具 | 用途 | 操作方式 |
@@ -687,10 +728,12 @@ docker compose stop navigation localization
 docker compose rm -f localization
 docker compose up -d fast_lio localization
 
-# 确认重新初始化并加载修后的地图，再启动 navigation
+# 先确认加载修后的地图和新定位参数
 docker compose logs -f localization | \
-  grep -E "read map|Localization initialization succeeded|ICP: accepted|Rejecting"
+  grep -E "read map|Map/odom height|ICP 4.00 Hz|Localization initialization succeeded|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history"
 ```
+
+重启后将 Foxglove Fixed Frame 设为 `map`。若机器人不在该层地图的建图起点附近，必须重新发送 `/initialpose` 并确认 `Manual relocalization applied`。然后重新执行 **2.3 使用成品地图做 Open3D ICP 验收** 中的 Z/TF、时间戳和连续 accepted 检查，全部通过后才能启动 navigation。
 
 ---
 
@@ -776,13 +819,15 @@ docker compose rm -f fast_lio localization
 docker compose up -d fast_lio localization
 
 docker compose logs -f fast_lio localization | \
-  grep -E "IMU Initial Done|FAST_LIO_TIMING|FAST_LIO_GUARD|ICP 4.00 Hz|Localization initialization succeeded|ICP: accepted|Rejecting"
+  grep -E "IMU Initial Done|FAST_LIO_TIMING|FAST_LIO_GUARD|Map/odom height|ICP 4.00 Hz|Localization initialization succeeded|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history"
 ```
 
 **初始位姿对齐：**
 - 当前位置与建图起始位姿一致 → 无需操作
-- 偏差 > 1m 或 > 90° → Foxglove 发送 `/initialpose` 指定机器人在地图上的位置
+- Foxglove Fixed Frame 必须先设为 `map`
+- 偏差 > 1m 或 > 90° → Foxglove 发送 `/initialpose` 指定机器人在地图上的位置，并确认日志出现 `Manual relocalization applied`
 - localization 日志出现 `ICP: accepted=true`，且 `fitness>0.50`、`rmse<=0.30` 并通过 correction 门，才表示该帧真正更新了 `map -> odom`
+- `fitness=1.000` 也不能单独证明高度正确；必须同时确认 `map_odom_z=1.247`
 - 至少稳定观察约 10 秒 accepted 更新后再启动 navigation
 
 ### 5.2 启动导航
@@ -835,8 +880,8 @@ ros2 run bot_navigation localization_monitor.py --ros-args \
 **启动就绪检查顺序（必须按序，否则必飘）：**
 1. ✅ bringup 出现 `livox custom format` → 雷达就绪
 2. ✅ fast_lio 出现 `IMU Initial Done`，且 `/Odometry_loc`、`/cloud_registered_1` 正常 → 里程计就绪
-3. ✅ localization 日志确认 `ICP 4.00 Hz (250.0 ms), queue=1, stamp_skew<=0.030s`
-4. ⚠️ 初始位置不在建图起点附近时，通过 Foxglove 发送 `/initialpose`
+3. ✅ localization 日志确认 `Map/odom height constraint: enabled=true z=1.247 m`，且 `ICP 4.00 Hz (250.0 ms), cloud_queue=1, odom_history=30, ... stamp_skew<=0.030s`
+4. ⚠️ 初始位置不在建图起点附近时，将 Foxglove Fixed Frame 设为 `map` 后发送 `/initialpose`
 5. ✅ 连续出现可信 `ICP: accepted=true`，跳变帧能被 1m/15deg 门限拒绝
 6. ✅ 最后启动 navigation
 
@@ -986,12 +1031,12 @@ IMU propagation 前后也会检查状态与 covariance 是否 finite；传播后
 
 这是防止误把 `/cloud_registered_body_1` 或其他机器人随动坐标点云接入 ICP。算法的 source crop、初值和 map→odom 计算都假定输入点已经在 FAST-LIO 世界坐标中；body-frame 点云若混入，会直接制造“点云随机器人转、ICP 又尝试把它对地图”的灾难性错误。
 
-Foxglove 仍使用：
+Foxglove 必须区分两种用途：
 
-- Fixed Frame = `camera_init`
-- Display/Follow Frame = `camera_init`
-- 世界地图观察 = `/cloud_registered_1`
-- 不用 `/cloud_registered_body_1` 判断地图是否稳定
+- 检查 FAST-LIO 自身是否漂移：Fixed/Display Frame = `camera_init`，只看 `/cloud_registered_1`。
+- 检查成品地图定位和导航：Fixed Frame = `map`，Display/Follow Frame = `map` 或 `g1_robot/base_footprint`，叠加 `/pcd_map`、`/cloud_registered_1` 和 `/map`。
+- `/initialpose` 只能在 Fixed Frame = `map` 时发送；非 `map` frame 会被明确拒绝。
+- 不用 `/cloud_registered_body_1` 判断世界地图是否稳定。
 
 ### 4. `/initialpose` 与运行中 ICP 的并发保护
 
@@ -1066,7 +1111,7 @@ max_icp_rotation_step_deg: 15.0
 启动日志应包含：
 
 ```text
-ICP 4.00 Hz (250.0 ms), queue=1, ... immediate<=0.10m/2.0deg, ... confirmations=2 within 1.00s
+ICP 4.00 Hz (250.0 ms), cloud_queue=1, odom_history=30, ... immediate<=0.10m/2.0deg, ... confirmations=2 within 1.00s
 ```
 
 初始化必须先看到：
@@ -1104,7 +1149,7 @@ max_scan_odom_time_skew_sec: 0.03
 启动日志应包含：
 
 ```text
-ICP 4.00 Hz (250.0 ms), queue=1, ... stamp_skew<=0.030s ...
+ICP 4.00 Hz (250.0 ms), cloud_queue=1, odom_history=30, ... stamp_skew<=0.030s ...
 ```
 
 若出现以下日志，Open3D 会等待同帧数据，不会提交 ICP：

@@ -27,7 +27,7 @@
 | 固定参考系 | 显示参考系 | 效果 |
 |-----------|-----------|------|
 | `map` | `map` | 地图静止，镜头固定，机器人自己移动 |
-| `map` | `base_link` | 地图静止，镜头跟随机器人移动 ← **推荐** |
+| `map` | `g1_robot/base_footprint` | 地图静止，镜头跟随机器人地面投影移动 ← **推荐** |
 | `base_link` | `base_link` | 机器人居中，ICP校正时整个地图会抖动 ← 避免 |
 
 ### 推荐设置
@@ -35,7 +35,7 @@
 | 字段 | 推荐值 | 说明 |
 |------|--------|------|
 | 固定参考系 | `map` | 地图固定不动 |
-| 显示参考系 | `base_link` | 镜头跟随机器人 |
+| 显示参考系 | `g1_robot/base_footprint` | 镜头跟随机器人地面投影 |
 | 跟踪模式 | 位姿（位置+姿态） | 相机跟随机器人姿态 |
 
 ---
@@ -45,8 +45,9 @@
 | 优先级 | 话题 | 说明 |
 |--------|------|------|
 | ✅ 必看 | `/map` | 静态地图（需 localization 服务运行） |
-| ✅ 必看 | `/cloud_registered_body_1` | 实时点云（设衰减时间 0.5~2.0s） |
+| ✅ 必看 | `/cloud_registered_1` | FAST-LIO 世界点云；导航对齐检查时 Decay 设为 `0` |
 | ✅ 必看 | `/tf` | 坐标系树 |
+| 🔵 可选 | `/pcd_map` | Open3D 使用的成品 3D 地图 |
 | 🔵 可选 | `/g1_robot/global_costmap/costmap` | 全局代价地图 |
 | 🔵 可选 | `/g1_robot/plan` | 规划路径 |
 | ❌ 建议关 | `/g1_robot/local_costmap/costmap` | 高频闪烁，10Hz |
@@ -93,16 +94,27 @@
 左侧 **场景** → **背景**颜色 → 改为 `#1a1a1a`
 
 ### 点云一直闪烁
-主题列表 → `/cloud_registered_body_1` → **点衰减时间** 设 `1.0` 秒
+导航对齐检查使用 `/cloud_registered_1`，**点衰减时间**设为 `0`。`/cloud_registered_body_1` 只用于查看机器人当前局部扫描，不能判断世界地图是否漂移。
 
 ### `/map` 不显示
 1. 确认 `localization` 服务在运行：`docker compose up fast_lio localization`
 2. 固定参考系改为 `map`
 
 ### 机器人显示在地图下方
-原因：FAST-LIO `camera_init` z=0 对应 IMU 离地 1.247m，2D地图渲染在 z=0 平面，实际地板在 z=-1.247m。
+先确认 Fixed Frame 是 `map`，不是 `camera_init`。成品 PCD 的地面已经校正到 `map z≈0`，定位节点会固定 `map -> odom.z≈+1.247m`，将实时点云地面从 `camera_init z≈-1.247m` 对齐到 `map z≈0`。
 
-修复：主题列表 → `/map` → **位置 Z** 设为 `-1.247`
+不要再手工给 `/map` 设置 `-1.247` 的显示偏移。应检查：
+
+```bash
+docker exec -it g1_robot_localization bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /botbrain_ws/install/setup.bash
+  ros2 topic echo --once /odom2map --field pose.pose.position
+  ros2 run tf2_ros tf2_echo map camera_init
+'
+```
+
+两者的 Z 都应约为 `+1.247`。若数值正确但在 `camera_init` Fixed Frame 下红色 `/pcd_map` 仍偏高，这是其启动时旧时间戳造成的显示现象，切换到 `map` 即可。
 
 ### Schema 不匹配警告（`/scan`、`/livox/lidar`）
 不影响功能，忽略即可。如需消除，从 `foxglove_bridge_params.yaml` 白名单删掉 `/scan`。
@@ -111,24 +123,23 @@
 
 ## 6. ⚠️ 发送 `/initialpose` 的 z 值问题（重要）
 
-**Foxglove 2D工具固定发 z=0，但定位节点需要 z=1.247，会导致 fitness→0.0，所有话题消失。**
+Foxglove 2D 工具会在当前 Fixed Frame 中发布位姿，因此发送前必须先把 Fixed Frame 设置为 `map`。
 
-原因：`open3d_loc` 的 `CallbackInitialPose` 不做坐标系转换，直接使用消息里的 x/y/z：
-```cpp
-mat_odom2map_ = mat_initialpose_;  // 不检查 frame_id，直接用
-```
+`initialpose_z_fix` 会把 2D 工具给出的 `z=0` 自动改为 `1.247`。定位链路只接受 `frame_id=map`，若收到 `camera_init`，relay 会先输出 `ignoring /initialpose...`；若绕过 relay 直接发到校正话题，C++ 节点会输出 `Rejecting initial pose...`。两者都会防止把错误参考系静默当作地图坐标。
 
-### 正确做法：命令行发送
+### 命令行发送方式
 
 ```bash
 docker exec -it g1_robot_bringup bash
 source install/setup.bash
 
-# x y 改为机器人在地图中的实际坐标，z 必须是 1.247
+# x y 改为机器人在地图中的实际坐标；z=0 会由 relay 校正为 1.247
 ros2 topic pub --once /initialpose \
   geometry_msgs/msg/PoseWithCovarianceStamped \
-  "{header: {frame_id: 'map'}, pose: {pose: {position: {x: 0.0, y: 0.0, z: 1.247}, orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}}}}"
+  "{header: {frame_id: 'map'}, pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}}}}"
 ```
+
+成功时 localization 日志必须出现 `Manual relocalization applied`。若没有该日志，先检查 `/initialpose -> /initialpose_corrected` 的 publisher/subscriber 链路。
 
 若机器人在建图起始点附近，直接重启用默认值重初始化：
 ```bash
@@ -141,9 +152,10 @@ docker compose restart localization
 
 | 参数 | 值 | 影响 |
 |------|-----|------|
-| `loc_frequence` | 2.5 Hz | 每0.4s校正一次，快速移动容易丢失 |
+| `loc_frequence` | 4.0 Hz | 约每0.25s尝试一次新点云 ICP |
 | `filter_odom2map` | false | 无卡尔曼平滑，校正时位姿跳变 |
-| `threshold_fitness` | 0.9 | 低于此值拒绝 ICP 结果 |
+| `threshold_fitness` | 0.5 | 还必须同时通过 RMSE、步长和多帧一致性门限 |
+| `lock_map_odom_z` | true | 对校正后平层 PCD 固定 `map -> odom.z=1.247` |
 
 **操作建议**：
 - 机器人慢速移动
