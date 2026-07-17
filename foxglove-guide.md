@@ -38,6 +38,16 @@
 | 显示参考系 | `g1_robot/base_footprint` | 镜头跟随机器人地面投影 |
 | 跟踪模式 | 位姿（位置+姿态） | 相机跟随机器人姿态 |
 
+### 建图/导航时参考系选择
+
+| 场景 | 固定参考系 | 显示参考系 | 主要看什么 |
+|------|------------|------------|------------|
+| 建图检查 | `camera_init` 或 `map` | `camera_init` / `map` | FAST-LIO 世界点云、累计栅格是否正常生成 |
+| 定位检查 | `map` | `g1_robot/base_footprint` | `/pcd_map`、`/cloud_registered_1`、`/localization_3d` 是否对齐 |
+| 导航执行 | `map` | `g1_robot/base_footprint` | `/map`、机器人 footprint、`/g1_robot/plan`、局部避障 |
+
+注意：建图时看到的实时累计栅格/点云会继续变化；导航时 `/map` 是静态地图，动态黑点通常来自 costmap 或点云叠加，不代表地图文件被改写。
+
 ---
 
 ## 3. 推荐话题配置
@@ -50,7 +60,8 @@
 | 🔵 可选 | `/pcd_map` | Open3D 使用的成品 3D 地图 |
 | 🔵 可选 | `/g1_robot/global_costmap/costmap` | 全局代价地图 |
 | 🔵 可选 | `/g1_robot/plan` | 规划路径 |
-| ❌ 建议关 | `/g1_robot/local_costmap/costmap` | 高频闪烁，10Hz |
+| ⚠️ 谨慎开 | `/cloud_effected_1`、`/cloud_registered_body_1` | 实时局部点云/诊断点，容易让画面看起来像地图在变 |
+| ❌ 建议关 | `/g1_robot/local_costmap/costmap` | 高频闪烁，10Hz；只在排查避障时临时打开 |
 | ❌ 建议关 | `/g1_robot/trajectories` | MPPI 2000条轨迹，闪烁严重 |
 
 ---
@@ -95,6 +106,65 @@
 
 ### 点云一直闪烁
 导航对齐检查使用 `/cloud_registered_1`，**点衰减时间**设为 `0`。`/cloud_registered_body_1` 只用于查看机器人当前局部扫描，不能判断世界地图是否漂移。
+
+### 点云看起来倾斜
+先确认打开的是哪个点云：
+
+| 话题 | 坐标系 | 是否会随机器人身体倾斜 | 用途 |
+|------|--------|------------------------|------|
+| `/cloud_registered_body_1` | `body` | 会 | 诊断当前雷达帧、局部避障输入来源 |
+| `/cloud_registered_1` | `camera_init` / 世界系 | 不应持续倾斜 | 判断 FAST-LIO 世界点云是否漂移 |
+| `/pcd_map` | `map` | 不应倾斜 | 判断成品 3D 地图和定位是否对齐 |
+
+G1 走路时机身会有 roll/pitch，`/cloud_registered_body_1` 在 `map` 固定参考系下显示会看起来一边高一边低，这是 body frame 诊断点云的正常现象。判断地图是否真的倾斜，应关闭 `/cloud_registered_body_1`，只看 `/cloud_registered_1`、`/pcd_map` 和 `/map`。
+
+导航用的 `/scan` 会从 `/cloud_registered_body_1` 转到 `g1_robot/base_footprint` 平面坐标后再做高度过滤，避免 body 倾斜时把地面误当成障碍。
+
+### 黑点/障碍物越来越多
+先判断黑点来自哪一层：
+
+| 现象 | 常见来源 | 说明 |
+|------|----------|------|
+| 只开 `/map` 也在变黑 | 静态地图源异常 | 需要检查 map server 加载的 `.yaml/.pgm` |
+| 关掉 costmap/点云后不再变 | 动态层叠加 | 这是 `/g1_robot/*costmap*`、`/cloud_*`、`/scan*` 的显示效果 |
+| 黑块围着障碍扩大 | `inflation_layer` | costmap 会把障碍膨胀，方便导航避障 |
+| 机器人附近整片发黑 | 近身点/地面点被当障碍 | 检查 `/scan` 的 `range_min`、高度带，以及 local costmap 的 `obstacle_min_range` |
+| 人走过后残留黑点 | obstacle clearing 不完整 | 检查 `/scan` 是否有空方向、costmap 的 `inf_is_valid` 是否为 `true`，以及 TF 时间是否丢帧 |
+
+`/scan` 必须只保留 `sensor_msgs/msg/LaserScan`。Open3D 定位节点的调试点云应发布到 `/scan_loc`；如果 `ros2 topic list -t` 显示 `/scan` 同时存在 `PointCloud2` 和 `LaserScan`，说明定位节点的重映射未生效，需要先修复话题冲突。
+
+如果 `/Odometry_loc`、`/cloud_registered_1` 和 `/scan` 同时停止，并且 FAST-LIO 日志出现 `output latched unhealthy`，这是连续匹配失败后的安全停发，不是 Foxglove 显示故障。此时不要继续导航，应检查 timing/effective points 后重启 `fast_lio`。
+
+导航时推荐先只显示：
+
+```text
+/map
+/g1_robot/global_costmap/published_footprint
+/g1_robot/local_costmap/published_footprint
+/g1_robot/plan
+/g1_robot/transformed_global_plan
+```
+
+如果要看避障，再临时打开 `/scan` 和 `/g1_robot/local_costmap/costmap`。不要把 costmap 的黑点当成静态地图被改写。
+
+当前导航配置里 `global_costmap` 包含：
+
+```text
+static_layer + obstacle_layer(/scan) + denoise_layer + inflation_layer
+```
+
+也就是说，全局代价地图仍参与规划，也会看到附近动态行人，但动态层只接过滤后的 `/scan`，并启用 raytrace clearing、denoise 和较小 inflation。已经写进 `ug.pgm` 的行人/噪点属于静态地图内容，必须修图擦除；运行时新出现的行人应由 global/local costmap 的 `/scan` 清除机制处理。局部避障主要由 `local_costmap` 的 rolling window 负责。
+
+如果黑点已经影响导航，可清理动态 costmap：
+
+```bash
+docker exec -it g1_robot_navigation bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /botbrain_ws/install/setup.bash
+  ros2 service call /g1_robot/global_costmap/clear_entirely_global_costmap nav2_msgs/srv/ClearEntireCostmap {}
+  ros2 service call /g1_robot/local_costmap/clear_entirely_local_costmap nav2_msgs/srv/ClearEntireCostmap {}
+'
+```
 
 ### `/map` 不显示
 1. 确认 `localization` 服务在运行：`docker compose up fast_lio localization`
