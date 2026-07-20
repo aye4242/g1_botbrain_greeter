@@ -170,6 +170,19 @@ docker exec -it g1_robot_navigation bash -lc '
 1. 确认 `localization` 服务在运行：`docker compose up fast_lio localization`
 2. 固定参考系改为 `map`
 
+### 有路径但机器人提前停止
+
+先区分 Nav2 是“成功到达”还是“中途取消/失败”：
+
+- `Goal reached` / `SUCCEEDED`：检查 planner `tolerance` 和 `xy_goal_tolerance`，两者的停车误差可叠加。
+- `Goal was canceled` / `ABORTED`：检查 `compute_path_to_pose` timeout、`/scan` 新鲜度和 TF，这不是到点容差问题。
+- 有 `cmd_vel_nav` 但机器人不动：检查高优先级 `manipulation_vel`、`cmd_vel_joy` 或 dead-man lock 是否覆盖 twist mux。
+- `/scan` 持续断流或 FAST-LIO 出现 `output latched unhealthy`：导航必须停止，不要通过放大 timeout 强行继续。
+
+Foxglove 发布 `/g1_robot/goal_pose` 和 `waypoint_navigator.py` 最终都进入同一个 NavigateToPose BT。Waypoint 工具不应自行在目标附近取消 action 并当作成功。
+
+`/g1_robot/bt_navigator` 已原生订阅 `/g1_robot/goal_pose`。不要再启动自定义 `goal_pose_bridge.py`，否则同一个 Foxglove 目标可能被重复发送。
+
 ### 机器人显示在地图下方
 先确认 Fixed Frame 是 `map`，不是 `camera_init`。成品 PCD 的地面已经校正到 `map z≈0`，定位节点会固定 `map -> odom.z≈+1.247m`，并将 `map -> odom` 的 roll/pitch 约束为零，只允许 ICP 修正平面 `x/y/yaw`。
 
@@ -214,10 +227,9 @@ ros2 topic pub --once /initialpose \
 
 成功时 localization 日志必须出现 `Manual relocalization applied`。若没有该日志，先检查 `/initialpose -> /initialpose_corrected` 的 publisher/subscriber 链路。
 
-若机器人在建图起始点附近，直接重启用默认值重初始化：
-```bash
-docker compose restart localization
-```
+启动定位服务后，节点会使用当前 `/cloud_registered_1` 与完整 `/pcd_map` 做 FPFH/RANSAC 全局粗配准，再用 ICP 精配准。它不读取上一次位姿，也不要求机器人位于建图起点。
+
+只有连续两帧得到一致的地图位置，并同时通过 fitness 和 RMSE 门限，才会提交新的 `map -> odom`。日志出现 `Global localization initialization succeeded` 表示自动初始化完成；持续出现 `Global initialization did not produce...` 时，再使用 `/initialpose` 作为人工兜底。
 
 ---
 
