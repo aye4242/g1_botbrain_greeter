@@ -480,9 +480,36 @@ head -n 11 "$maps/floor1_scans.pcd" | \
 cd /data/unitree/botbrain_ws/botbrain_ws/src/g1_pkg/maps
 ln -sfn floor1_scans.pcd scans.pcd
 ln -sfn floor1.yaml accumulated.yaml
-readlink -f scans.pcd
-readlink -f accumulated.yaml
+
+# 三个文件必须存在，且解析符号链接后的场景名必须一致
+pcd=$(readlink -f scans.pcd)
+yaml=$(readlink -f accumulated.yaml)
+image=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$yaml" | head -n 1)
+image=${image#\"}; image=${image%\"}; image=${image#\'}; image=${image%\'}
+case "$image" in
+  /*) pgm=$(readlink -f "$image") ;;
+  *)  pgm=$(readlink -f "$(dirname "$yaml")/$image") ;;
+esac
+printf 'PCD : %s\nYAML: %s\nPGM : %s\n' "$pcd" "$yaml" "$pgm"
+test -s "$pcd" && test -s "$yaml" && test -s "$pgm" || {
+  echo "ERROR: PCD/YAML/PGM 缺失或为空"; exit 1;
+}
+
+pcd_stem=$(basename "$pcd" .pcd)
+pcd_scene=${pcd_stem%_scans}
+yaml_scene=$(basename "$yaml" .yaml)
+pgm_name=$(basename "$pgm")
+pgm_scene=${pgm_name%.*}
+expected_pcd_scene=$yaml_scene
+[ "$yaml_scene" = accumulated ] && expected_pcd_scene=scans
+[ "$pcd_scene" = "$expected_pcd_scene" ] && [ "$pgm_scene" = "$yaml_scene" ] || {
+  echo "ERROR: 3D/2D 地图不是同一场景: PCD=$pcd_scene YAML=$yaml_scene PGM=$pgm_scene"
+  exit 1
+}
+echo "Map triplet check passed"
 ```
+
+`localization_3d.launch.py` 启动时会再执行同样的硬校验：推荐组合是 `<scene>_scans.pcd + <scene>.yaml + <scene>.pgm`；仅为兼容旧数据，也允许真实文件名为 `scans.pcd + accumulated.yaml + accumulated.pgm`。YAML 的 `image` 指向不存在的文件或者场景名不匹配时，localization 会直接启动失败，不得绕过校验进入导航。
 
 定位/导航阶段的 Foxglove 设置与建图阶段不同：
 
@@ -503,7 +530,7 @@ docker compose rm -f localization fast_lio
 docker compose up -d fast_lio localization
 
 docker compose logs -f localization | \
-  grep -E "Registered cloud|Planar base TF|Map/odom height|Map/odom roll/pitch|ICP 4.00 Hz|LocalizationInitialize|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history|Holding"
+  grep -E "Registered cloud|Planar base TF|Map/odom height|Map/odom roll/pitch|ICP 4.00 Hz|Global initialization|Prepared .*FPFH|Global candidate|LocalizationInitialize|localization initialization succeeded|Localization ready|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history|Holding"
 ```
 
 先确认定位节点已加载新参数：
@@ -515,7 +542,29 @@ Planar base TF: enabled=true odom -> g1_robot/base_footprint height=1.247 m
 ICP 4.00 Hz (250.0 ms), cloud_queue=1, odom_history=30, ... stamp_skew<=0.030s ...
 ```
 
-如果机器人没有位于建图起点附近，此时再通过 Foxglove `/initialpose` 给出实际位置。发送后必须看到：
+不论机器人是否在建图起点，都先让定位节点使用当前局部点云对完整 PCD 执行 FPFH/RANSAC 全局初始化。正常顺序是：
+
+```text
+Global initialization: enabled=true ... confirmations=3 scan_window=3
+Prepared ... map points for FPFH global initialization
+Global candidate seed=... map->odom=(...) RANSAC=... fitness=... rmse=...
+LocalizationInitialize: holding consistent global candidate (1/3 ... 3/3) ...
+Global localization initialization succeeded: ...
+Localization ready: verified map->odom is now available
+```
+
+只有最后的 `Localization ready` 出现后，经验证的 `map -> odom` 才对导航可用。启动时 `/localization_ready` 为 `false`，初始化通过后才以 transient-local QoS 发布 `true`：
+
+```bash
+docker exec -it g1_robot_localization bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /botbrain_ws/install/setup.bash
+  ros2 topic echo --once --qos-durability transient_local \
+    --qos-reliability reliable /localization_ready
+'
+```
+
+机器人启动位置不在建图起点并不是立即手工发送 `/initialpose` 的理由。先保持机器人静止，让全局候选完成 `3/3` 确认。只有日志长时间反复出现 `did not produce a valid FPFH/RANSAC candidate`、`rejecting global candidate` 或始终无法累积到 `3/3` 时，才通过 Foxglove `/initialpose` 给出实际位置作为失败回退。发送后必须看到：
 
 ```text
 Manual relocalization applied: requested map->base=(...), map->odom=(...)
@@ -524,9 +573,12 @@ Manual relocalization applied: requested map->base=(...), map->odom=(...)
 随后必须继续看到：
 
 ```text
-Localization initialization succeeded
+Local localization initialization succeeded
+Localization ready: verified map->odom is now available
 ICP: accepted=true fitness=... rmse=... correction=... map_odom_z=1.247 map_odom_rp=0.00/0.00 deg ...
 ```
+
+`/Odometry_loc`、`/g1_robot/odom`、`/localization_3d` 和已有 `map -> odom` TF 都不是可以反馈为自动 `/initialpose` 的外部绝对位姿：前两者是相对里程计，后两者是定位结果本身，反馈会形成循环确认。自动启动位置应由上述 PCD 全局特征匹配解决。
 
 若日志显示 `ignoring /initialpose in frame 'camera_init'` 或 `Rejecting initial pose in frame 'camera_init'`，说明 Foxglove Fixed Frame 仍设置错误，应改成 `map` 后重新发送。前者来自 `initialpose_z_fix`，消息会在到达 C++ 定位节点之前被拒绝。
 
@@ -737,10 +789,10 @@ docker compose up -d fast_lio localization
 
 # 先确认加载修后的地图和新定位参数
 docker compose logs -f localization | \
-  grep -E "read map|Map/odom height|ICP 4.00 Hz|Localization initialization succeeded|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history"
+  grep -E "read map|Global initialization|Global candidate|localization initialization succeeded|Localization ready|Map/odom height|ICP 4.00 Hz|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history"
 ```
 
-重启后将 Foxglove Fixed Frame 设为 `map`。若机器人不在该层地图的建图起点附近，必须重新发送 `/initialpose` 并确认 `Manual relocalization applied`。然后重新执行 **2.3 使用成品地图做 Open3D ICP 验收** 中的 Z/TF、时间戳和连续 accepted 检查，全部通过后才能启动 navigation。
+重启后将 Foxglove Fixed Frame 设为 `map`。先等待 FPFH/RANSAC 全局初始化和 `/localization_ready=true`；只有全局初始化持续失败时才发送 `/initialpose` 回退，并确认 `Manual relocalization applied`。然后重新执行 **2.3 使用成品地图做 Open3D ICP 验收** 中的 Z/TF、时间戳和连续 accepted 检查，全部通过后才能启动 navigation。
 
 ---
 
@@ -804,7 +856,7 @@ docker compose run --rm localization bash -lc '
 '
 ```
 
-不得把一个楼层的 PCD 与另一个楼层的 YAML/PGM 混用。切换后必须重新完成 `/initialpose` 和 ICP accepted 验收。
+不得把一个楼层的 PCD 与另一个楼层的 YAML/PGM 混用。切换后必须重新完成三文件配对检查、自动全局初始化和 ICP accepted 验收；`/initialpose` 仅用于自动初始化失败的回退。
 
 ---
 
@@ -817,6 +869,7 @@ cd /data/unitree/botbrain_ws
 
 # 导航前确认 mid360.yaml 中 pcd_save_en: false。本次定位、MPPI、
 # waypoint 和状态机边界都有修改，必须联合 build 到 install/。
+# 同时必须先完成 2.3 中的 PCD/YAML/PGM 三文件配对检查。
 docker compose run --rm builder_base bash -lc '
   source /opt/ros/humble/setup.bash
   cd /botbrain_ws
@@ -824,7 +877,7 @@ docker compose run --rm builder_base bash -lc '
     --cmake-args -DOpen3D_DIR=/opt/open3d/lib/cmake/Open3D
 '
 
-# 终端 1：基础服务
+# 终端 1：基础服务。rm 很重要：它会清除旧容器残留的 restart: always 策略。
 docker compose stop state_machine navigation localization
 docker compose rm -f state_machine navigation localization
 docker compose up -d bringup state_machine foxglove
@@ -835,13 +888,14 @@ docker compose rm -f fast_lio localization
 docker compose up -d fast_lio localization
 
 docker compose logs -f fast_lio localization | \
-  grep -E "IMU Initial Done|FAST_LIO_TIMING|FAST_LIO_GUARD|Planar base TF|Map/odom height|Map/odom roll/pitch|ICP 4.00 Hz|Localization initialization succeeded|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history"
+  grep -E "IMU Initial Done|FAST_LIO_TIMING|FAST_LIO_GUARD|Planar base TF|Map/odom height|Map/odom roll/pitch|ICP 4.00 Hz|Global initialization|Prepared .*FPFH|Global candidate|LocalizationInitialize|localization initialization succeeded|Localization ready|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history"
 ```
 
 **初始位姿对齐：**
-- 当前位置与建图起始位姿一致 → 无需操作
-- Foxglove Fixed Frame 必须先设为 `map`
-- 偏差 > 1m 或 > 90° → Foxglove 发送 `/initialpose` 指定机器人在地图上的位置，并确认日志出现 `Manual relocalization applied`
+- 启动后先保持机器人静止，等待 FPFH/RANSAC 连续三个一致候选，不需要机器人站在建图起点
+- 必须看到 `Global localization initialization succeeded`、`Localization ready` 以及 `/localization_ready=true`
+- 在 ready 之前不发布用于导航的猜测 `map -> odom`，Foxglove 暂时不能把点云叠到地图上属于预期保护行为
+- 只有全局候选长时间无法到达 `3/3` 时，才把 Foxglove Fixed Frame 设为 `map` 后发送 `/initialpose`，并确认 `Manual relocalization applied`
 - localization 日志出现 `ICP: accepted=true`，且 `fitness>0.50`、`rmse<=0.30` 并通过 correction 门，才表示该帧真正更新了 `map -> odom`
 - `fitness=1.000` 也不能单独证明高度正确；必须同时确认 `map_odom_z=1.247` 和 `map_odom_rp≈0/0deg`
 - 至少稳定观察约 10 秒 accepted 更新后再启动 navigation
@@ -852,7 +906,13 @@ docker compose logs -f fast_lio localization | \
 cd /data/unitree/botbrain_ws
 docker compose up -d navigation   # 终端3
 
-# navigation 内部有 30s 延迟；最多轮询 90s，容器 running 不等于 Nav2 可用
+# 先看 preflight：容器先 sleep 30s，然后最多等待 300s。
+# 看到 passed 后 Ctrl+C 退出日志跟随，再执行下方 lifecycle 检查。
+docker compose logs -f navigation | \
+  grep -E "Waiting for navigation inputs|Navigation preflight passed|preflight timed out|ERROR|FATAL"
+
+# preflight 通过后再最多轮询 Nav2 lifecycle 90s。
+# 从 docker compose up 到可用总等待时间要预留 330s 以上。
 docker exec -it g1_robot_navigation bash -lc '
   source /opt/ros/humble/setup.bash
   source /botbrain_ws/install/setup.bash
@@ -892,6 +952,18 @@ ros2 topic info /Odometry_loc | grep "Publisher count"
 rviz2 -d /home/aitech/Workspace/botbrain_project/configs/g1_nav_loc_rviz2.rviz
 ```
 
+preflight 同时硬性检查五项输入，任一项不满足都不会启动 Nav2。日志中的字段分别是 `scan`、`twist_odom`、`ready`、`confidence` 和 `tf`：
+
+| 日志字段 | 必须满足 | 失败时先查 |
+|---|---|---|
+| `scan` | `/scan` 接收时间和消息时间戳都在 1s 内 | FAST-LIO body 点云、pointcloud_to_laserscan 和 TF |
+| `twist_odom` | `/g1_robot/odom` 接收时间和时间戳都在 0.5s 内，`child_frame_id=g1_robot/base_footprint`，平面 twist 为有限数 | Unitree odom publisher、frame 配置和机器人时钟 |
+| `ready` | transient-local `/localization_ready=true` | FPFH/RANSAC 全局初始化或手工回退是否真正成功 |
+| `confidence` | 新鲜度 1s 内且 `>=0.55` | ICP fitness/RMSE、时间戳和 PCD 质量 |
+| `tf` | `map -> g1_robot/base_footprint` 存在，Z 与 roll/pitch 为合理平面值 | `map -> odom -> base_footprint` TF 链 |
+
+如果出现 `Navigation preflight timed out after 300.0 s`，容器会退出且 Nav2 不会启动。定位或 `/scan` 修复后需要再显式执行 `docker compose up -d navigation`；不应改短检查或让容器无限自动重启。
+
 六个 lifecycle 节点必须全部输出 `active [3]`，且 action 列表必须包含 `/g1_robot/navigate_to_pose`。否则不得发送导航点，先查看：
 
 ```bash
@@ -925,12 +997,12 @@ ros2 run bot_navigation waypoint_recorder.py list            # 查看点位
 ros2 run bot_navigation waypoint_navigator.py office1        # 单点导航
 ros2 run bot_navigation waypoint_navigator.py kitchen office1 home --loop  # 多点循环
 ros2 run bot_navigation localization_monitor.py --ros-args \
-  -p auto_anchor:=false -p auto_cancel:=true                  # 首次验收禁用无外部参考的自动 re-anchor
+  -p auto_cancel:=true                                       # 连续低置信度时取消导航
 ```
 
 > 点位文件：`/data/unitree/botbrain_ws/botbrain_ws/src/bot_navigation/nav_waypoints.yaml`
 >
-> 点位只保存平面 `x/y/yaw`：`z=0`、`qx=qy=0`。`waypoint_navigator` 不再在到点后把目标坐标硬发为 `/initialpose`；定位校正必须来自 Foxglove 人工确认或真实外部观测。
+> 点位只保存平面 `x/y/yaw`：`z=0`、`qx=qy=0`。`waypoint_navigator` 不再在到点后把目标坐标硬发为 `/initialpose`；`localization_monitor` 也不再存在 `auto_anchor` 参数，不会把当前定位输出反馈为初始位姿。启动绝对位置由 FPFH/RANSAC 求解，人工 `/initialpose` 只是失败回退。
 
 ### 5.4 服务启动延迟与就绪检查
 
@@ -938,8 +1010,8 @@ ros2 run bot_navigation localization_monitor.py --ros-args \
 |------|---------|---------|
 | `bringup`（雷达驱动） | 硬件握手 **5~10s** | `livox/lidar publish use livox custom format` |
 | `fast_lio` | **sleep 25s** | `/Odometry_loc` 与可信 `/cloud_registered_1` 持续发布，`FAST_LIO_TIMING ok=true` |
-| `localization` | **sleep 30s** | 初始化成功，随后出现 `ICP: accepted=true` |
-| `navigation` | **sleep 30s** | Nav2 lifecycle 全部 active |
+| `localization` | **sleep 30s** | `Global localization initialization succeeded`、`/localization_ready=true`，随后出现 `ICP: accepted=true` |
+| `navigation` | **sleep 30s + preflight 最多 300s** | `Navigation preflight passed`，随后 Nav2 lifecycle 全部 active |
 
 > bringup 刚起来时 fast_lio 打印 `No Effective Points!` 属正常，等雷达就绪后自动恢复。超过 30s 仍无点云再排查。
 
@@ -947,11 +1019,92 @@ ros2 run bot_navigation localization_monitor.py --ros-args \
 1. ✅ bringup 出现 `livox custom format` → 雷达就绪
 2. ✅ fast_lio 出现 `IMU Initial Done`，且 `/Odometry_loc`、`/cloud_registered_1` 正常 → 里程计就绪
 3. ✅ localization 日志确认高度、roll/pitch 和 `Planar base TF` 三个约束均为 `enabled=true`，且 `ICP 4.00 Hz (250.0 ms), cloud_queue=1, odom_history=30, ... stamp_skew<=0.030s`
-4. ⚠️ 初始位置不在建图起点附近时，将 Foxglove Fixed Frame 设为 `map` 后发送 `/initialpose`
+4. ✅ 等待三个一致 FPFH/RANSAC 全局候选，确认 `Localization ready` 和 `/localization_ready=true`；只在自动初始化失败时手工回退
 5. ✅ 连续出现可信 `ICP: accepted=true`，跳变帧能被 1m/15deg 门限拒绝
-6. ✅ 最后启动 navigation，并确认六个 lifecycle 节点全部 `active [3]` 且 `/g1_robot/navigate_to_pose` action 存在
+6. ✅ 启动 navigation 前确认 `/scan` 时间戳新鲜，等待 `Navigation preflight passed`
+7. ✅ Nav2 启动后确认 `/g1_robot/nav_odom` 持续发布、六个 lifecycle 节点全部 `active [3]` 且 `/g1_robot/navigate_to_pose` action 存在
 
 **启动导航必须同时保持 bringup、fast_lio、localization 正常运行。**
+
+### 5.5 `/scan` 断流与 observation buffer 告警分类
+
+`The /scan observation buffer has not been updated for ... seconds` 表示 costmap 没有收到可用的新观测。`expected_update_rate: 1.0` 的单位是秒，含义是两份可用 scan 的间隔不应超过 1s，不是设置为 1Hz 后可以忽略 80s 告警。不要把该参数改为 `0`来消除日志，否则只会隐藏冻结障碍物的安全故障。
+
+先在 bringup 容器中按数据链上游到下游检查：
+
+```bash
+docker exec -it g1_robot_bringup bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /botbrain_ws/install/setup.bash
+  ros2 topic list -t | grep -E "^/(cloud_registered_body_1|scan)[[:space:]]"
+  ros2 topic info -v /cloud_registered_body_1
+  ros2 topic info -v /scan
+  timeout 5 ros2 topic hz /cloud_registered_body_1 || true
+  timeout 5 ros2 topic hz /scan || true
+  timeout 5 ros2 topic echo --once /cloud_registered_body_1 --field header || true
+  timeout 5 ros2 topic echo --once /scan --field header || true
+  timeout 3 ros2 run tf2_ros tf2_echo g1_robot/base_footprint body || true
+  timeout 3 ros2 run tf2_ros tf2_echo map g1_robot/base_footprint || true
+  timeout 3 ros2 run tf2_ros tf2_echo g1_robot/odom g1_robot/base_footprint || true
+'
+```
+
+| 检查结果 | 问题层级 | 处理 |
+|---|---|---|
+| `/scan` 没有 publisher | bringup 内 `pointcloud_to_laserscan` 未启动或 install 仍是旧版 | 查 bringup 日志，重新 build `g1_pkg` 并重建 bringup 容器 |
+| `/cloud_registered_body_1` 无新数据 | FAST-LIO/雷达上游断流 | 查 `IMU Initial Done`、`FAST_LIO_TIMING`、guard 和 `output latched unhealthy`，不要继续导航 |
+| body 点云有数据，`/scan` 无消息 | 点云到 `g1_robot/base_footprint` 的同时间戳 TF 不可用，或 pointcloud_to_laserscan 未收到输入 | 查点云 `frame_id`、平面 base TF、节点订阅/QoS 和 message-filter 日志 |
+| `/scan` 持续发布，但 ranges 几乎全是 `inf` | 环境当前确实无回波，或高度/距离带排除了所有有限点 | 对照 body 点云检查 `min_height/max_height`、`range_min/range_max`；不要把全 `inf` 误判为话题断流 |
+| `/scan` 有新数据，costmap 仍告警 | scan 到 `map`/`g1_robot/odom` 的 TF 在消息时间戳处被拒绝，或 `/scan` 存在多类型/旧容器 | 确认 `/scan` 只有 `sensor_msgs/msg/LaserScan`，再查两条 TF 和重建 navigation |
+| bringup 启动时就出现 navigation 告警 | 旧 navigation/localization 容器还保留 `restart: always` | 执行 `docker compose stop navigation localization && docker compose rm -f navigation localization`，修复后再显式启动 |
+
+查联合日志时使用：
+
+```bash
+docker compose logs --tail 250 bringup fast_lio localization navigation | \
+  grep -E "pointcloud_to_laserscan|Transform|Message Filter|cloud_registered_body|output latched unhealthy|observation buffer|Navigation preflight"
+```
+
+### 5.6 动态行人、膨胀和 local costmap 居中验收
+
+全局和局部 costmap 的 `/scan` 均已启用 `marking=true`、`clearing=true`、`observation_persistence=0`、`inf_is_valid=true`，并且 raytrace 距离大于障碍标记距离。复测时必须先确认 `/scan` 无断流，然后让行人进入并离开雷达可见区域：运行时新增的行人应先被标记，随后在空闲射线再次观测到该区域时清除。
+
+判断前先单独显示 `/map`：如果关掉两个 costmap 和点云后黑点仍在，该行人/噪点已写入 PGM，动态 clearing 不可能修改静态地图文件，必须用 Map Editor 擦除。清空 costmap service 只用于诊断运行时动态层，不能代替正常射线清理。
+
+global inflation 当前保留 `inflation_radius=0.35m`，因为机器人加 padding 后的外接半径约为 `0.34m`；继续缩小会削弱 footprint 碰撞保护。`cost_scaling_factor=15.0` 使软代价更快衰减，用于缩窄视觉上的膨胀带，不应根据 Foxglove 叠加颜色再随意改小安全半径。
+
+local costmap 的配置是 `g1_robot/odom` 坐标系下 `8m x 8m` 的 `rolling_window=true`，正常时机器人应在窗口中心。Foxglove 列表中该图层是灰色且眼睛带删除线时，表示图层实际被隐藏，不能用该截图判断未居中。先打开 `/g1_robot/local_costmap/costmap`，再用同一 costmap 时间戳的 TF 做数值验证：
+
+```bash
+docker exec -it g1_robot_navigation bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /botbrain_ws/install/setup.bash
+  ros2 run bot_navigation costmap_center_check.py
+'
+```
+
+通过时会输出 costmap `origin/center`、同时间戳的 base 位置和 `error`。在 `0.05m` 分辨率下默认允许两个栅格，即 `error<=0.10m`。若失败，先查 costmap header 时间戳和 `g1_robot/odom -> g1_robot/base_footprint` TF，不要通过手工改 costmap origin 迁就截图。
+
+### 5.7 `/g1_robot/nav_odom` 与里程计偏移检查
+
+原 `/g1_robot/odom` 消息的 pose/yaw 来自 Unitree，而 `odom -> base_footprint` TF 来自 FAST-LIO，两者不是同一个位姿状态。导航现在统一使用 `/g1_robot/nav_odom`：平面 `x/y/yaw` 取自 `/Odometry_loc` 并与 TF 一致，twist 取自 `/g1_robot/odom`。检查：
+
+```bash
+docker exec -it g1_robot_navigation bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /botbrain_ws/install/setup.bash
+  ros2 topic info -v /g1_robot/nav_odom
+  timeout 5 ros2 topic hz /g1_robot/nav_odom || true
+  timeout 5 ros2 topic echo --once /g1_robot/nav_odom --field header || true
+  timeout 3 ros2 run tf2_ros tf2_echo g1_robot/odom g1_robot/base_footprint || true
+'
+
+docker compose logs --tail 120 navigation | \
+  grep -E "Nav odom relay|coherent planar nav odometry|Unitree odometry twist.*stale"
+```
+
+`/g1_robot/nav_odom` 应只有一个 `nav_odom_relay` publisher，帧为 `g1_robot/odom -> g1_robot/base_footprint` 且频率稳定。出现 `Unitree odometry twist is missing or stale` 时 relay 会输出零速并提高协方差，应先修复 Unitree odom 断流再发目标。不再用 `/g1_robot/odom` 的 pose 判断导航 TF 是否正确，也不得把任何相对 odom 话题转发为 `/initialpose`。
+
 ### 代码更新与重编译
 
 #### ⚠️ 重要：必须 build 才能生效
