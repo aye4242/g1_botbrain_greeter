@@ -1,21 +1,133 @@
 import os
+import re
+from pathlib import Path
+
+import yaml
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import (
+    DeclareLaunchArgument,
+    LogInfo,
+    OpaqueFunction,
+    SetLaunchConfiguration,
+)
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
+def _pcd_scene_name(path):
+    stem = Path(path).resolve(strict=True).stem
+    return stem[:-6] if stem.endswith('_scans') else stem
+
+
+def _validate_map_pair(context, maps_dir):
+    scene = LaunchConfiguration('map_scene').perform(context).strip()
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', scene):
+        raise RuntimeError(
+            f'Invalid map_scene {scene!r}; use only letters, digits, "_" or "-".'
+        )
+
+    map_file = LaunchConfiguration('map_file').perform(context).strip()
+    grid_map_file = LaunchConfiguration('grid_map_file').perform(context).strip()
+    pcd_path = Path(map_file or os.path.join(maps_dir, f'{scene}_scans.pcd'))
+    grid_path = Path(grid_map_file or os.path.join(maps_dir, f'{scene}.yaml'))
+    try:
+        resolved_pcd = pcd_path.resolve(strict=True)
+        resolved_grid = grid_path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f'Map scene {scene!r} is incomplete; missing {exc.filename}. '
+            f'Expected {scene}_scans.pcd, {scene}.yaml and {scene}.pgm.'
+        ) from exc
+    if (
+        not resolved_pcd.is_file()
+        or resolved_pcd.stat().st_size == 0
+        or resolved_pcd.suffix.lower() != '.pcd'
+        or not resolved_grid.is_file()
+        or resolved_grid.stat().st_size == 0
+        or resolved_grid.suffix.lower() != '.yaml'
+    ):
+        raise RuntimeError(
+            f'Map scene {scene!r} requires non-empty .pcd and .yaml files: '
+            f'PCD={resolved_pcd}, YAML={resolved_grid}'
+        )
+    try:
+        grid_data = yaml.safe_load(resolved_grid.read_text(encoding='utf-8'))
+    except yaml.YAMLError as exc:
+        raise RuntimeError(f'Invalid grid map YAML: {resolved_grid}: {exc}') from exc
+    if grid_data is None:
+        grid_data = {}
+    if not isinstance(grid_data, dict):
+        raise RuntimeError(
+            f'Grid map YAML root must be a mapping: {resolved_grid}'
+        )
+    image_value = grid_data.get('image')
+    if not isinstance(image_value, str) or not image_value.strip():
+        raise RuntimeError(f'Grid map YAML has no image entry: {resolved_grid}')
+
+    try:
+        image_path = (resolved_grid.parent / image_value).resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f'Grid map image does not exist for scene {scene!r}: '
+            f'{image_value}'
+        ) from exc
+    grid_scene = resolved_grid.stem
+    pcd_scene = _pcd_scene_name(resolved_pcd)
+    image_scene = image_path.stem
+    using_scene_defaults = not map_file and not grid_map_file
+    selected_scene_matches = (
+        not using_scene_defaults
+        or (
+            pcd_scene == scene
+            and grid_scene == scene
+            and image_scene == scene
+        )
+    )
+    if grid_scene == 'accumulated':
+        # Legacy generic pair: accumulated.yaml/pgm + scans.pcd.
+        expected_pcd_scene = 'scans'
+    else:
+        expected_pcd_scene = grid_scene
+
+    if (
+        not selected_scene_matches
+        or pcd_scene != expected_pcd_scene
+        or image_scene != grid_scene
+        or not image_path.is_file()
+        or image_path.stat().st_size == 0
+        or image_path.suffix.lower() != '.pgm'
+    ):
+        raise RuntimeError(
+            '3D/2D map scene mismatch: '
+            f'PCD={resolved_pcd} (scene={pcd_scene}), '
+            f'YAML={resolved_grid} (scene={grid_scene}), '
+            f'image={image_path} (scene={image_scene}). '
+            f'Requested map_scene={scene}. '
+            'Select matching <scene>_scans.pcd, <scene>.yaml and <scene>.pgm files.'
+        )
+    return [
+        LogInfo(msg=(
+            f'Map selection: scene={grid_scene} PCD={resolved_pcd} '
+            f'YAML={resolved_grid} PGM={image_path}'
+        )),
+        SetLaunchConfiguration('map_file', str(resolved_pcd)),
+        SetLaunchConfiguration('grid_map_file', str(resolved_grid)),
+    ]
+
+
 def generate_launch_description():
     workspace_dir = '/botbrain_ws'
-    default_pcd_path  = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'scans.pcd')
-    default_grid_yaml = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps', 'accumulated.yaml')
+    maps_dir = os.path.join(workspace_dir, 'src', 'g1_pkg', 'maps')
 
-    pcd_arg          = DeclareLaunchArgument('map_file', default_value=default_pcd_path)
-    grid_map_arg     = DeclareLaunchArgument('grid_map_file', default_value=default_grid_yaml)
+    map_scene_arg = DeclareLaunchArgument('map_scene', default_value='ug')
+    pcd_arg = DeclareLaunchArgument('map_file', default_value='')
+    grid_map_arg = DeclareLaunchArgument('grid_map_file', default_value='')
     use_sim_time_arg = DeclareLaunchArgument('use_sim_time', default_value='false')
 
-    open3d_config = PathJoinSubstitution([FindPackageShare('open3d_loc'), 'config', 'loc_param_g1.yaml'])
+    open3d_config = PathJoinSubstitution([
+        FindPackageShare('open3d_loc'), 'config', 'loc_param_g1.yaml'
+    ])
 
     IMU_HEIGHT = 1.247  # MID360 离地高度(m)，odom z=0 对应此高度
 
@@ -46,7 +158,9 @@ def generate_launch_description():
                 'planar_base_height':       IMU_HEIGHT,
                 'voxelsize_coarse':         0.15,
                 'voxelsize_fine':           0.2,    # 走廊环境大体素=大收敛盆地，防止跳局部最优
-                'threshold_fitness':        0.5,   # 0.7→0.5: 允许断流恢复时接受中等质量匹配；级联靠 dis_updatemap=5.0 防护
+                # Allow medium-quality recovery matches; dis_updatemap=5.0
+                # limits how quickly a bad alignment can enter the submap.
+                'threshold_fitness':        0.5,
                 'threshold_fitness_init':   0.5,
                 'loc_frequence':            4.0,    # 真实 4 Hz，即约每 250 ms 尝试一次 ICP
                 'max_icp_translation_step':  1.0,
@@ -81,15 +195,17 @@ def generate_launch_description():
                 'global_voxel_size':          0.40,
                 'global_ransac_max_iterations': 100000,
                 'global_ransac_confidence':   0.999,
+                'global_min_ransac_fitness':  0.15,
                 'global_min_fitness':         0.65,
                 'global_max_inlier_rmse':     0.30,
                 'global_retry_interval_sec':  1.0,
-                'global_initialization_confirmations': 2,
+                'global_initialization_confirmations': 3,
                 'global_candidate_consistency_translation': 0.35,
                 'global_candidate_consistency_rotation_deg': 5.0,
-                'global_candidate_max_age_sec': 15.0,
+                'global_candidate_max_age_sec': 30.0,
                 'global_min_source_points':   100,
                 'global_min_target_points':   1000,
+                'global_scan_window_size':    3,
                 'save_scan':                False,
                 'maxpoints_source':         80000,
                 'maxpoints_target':         400000,
@@ -173,9 +289,14 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        map_scene_arg,
         pcd_arg,
         grid_map_arg,
         use_sim_time_arg,
+        OpaqueFunction(
+            function=_validate_map_pair,
+            kwargs={'maps_dir': maps_dir},
+        ),
         initialpose_z_fix,
         global_localization,
         static_tf_camera_init,
