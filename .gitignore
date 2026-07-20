@@ -3,6 +3,7 @@ botbrain_ws/build/
 botbrain_ws/install/
 botbrain_ws/log/
 botbrain_ws/detect_img/
+botbrain_ws/.runtime/
 
 # 运行时日志/数据
 log/

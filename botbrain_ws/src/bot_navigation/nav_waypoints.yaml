@@ -1,64 +1,67 @@
-waypoints:
-  home:
-    frame: g1_robot/map
-    qw: 0.682939
-    qx: 0.0
-    qy: 0.0
-    qz: 0.730476
-    x: -0.0143
-    y: -0.1499
-    z: 0.0
-  office1:
-    frame: g1_robot/map
-    qw: 0.998843
-    qx: 0.0
-    qy: 0.0
-    qz: 0.048095
-    x: 0.4519
-    y: 0.7688
-    z: 0.0
-  office2:
-    frame: g1_robot/map
-    qw: 0.690038
-    qx: 0.0
-    qy: 0.0
-    qz: 0.723773
-    x: 1.1303
-    y: 2.5414
-    z: 0.0
-  office3:
-    frame: g1_robot/map
-    qw: 0.658983
-    qx: 0.0
-    qy: 0.0
-    qz: 0.752158
-    x: 0.6421
-    y: 8.1906
-    z: 0.0
-  office4:
-    frame: g1_robot/map
-    qw: 0.718853
-    qx: 0.0
-    qy: 0.0
-    qz: -0.695162
-    x: 0.7898
-    y: 3.4108
-    z: 0.0
-  office5:
-    frame: g1_robot/map
-    qw: 0.751312
-    qx: 0.0
-    qy: 0.0
-    qz: -0.659947
-    x: 1.4352
-    y: 1.1496
-    z: 0.0
-  turn:
-    frame: g1_robot/map
-    qw: 0.766512
-    qx: 0.0
-    qy: 0.0
-    qz: -0.642229
-    x: 0.7141
-    y: 7.2378
-    z: 0.0
+format_version: 2
+scenes:
+  ug:
+    waypoints:
+      home:
+        frame: g1_robot/map
+        qw: 0.682939
+        qx: 0.0
+        qy: 0.0
+        qz: 0.730476
+        x: -0.0143
+        y: -0.1499
+        z: 0.0
+      office1:
+        frame: g1_robot/map
+        qw: 0.998843
+        qx: 0.0
+        qy: 0.0
+        qz: 0.048095
+        x: 0.4519
+        y: 0.7688
+        z: 0.0
+      office2:
+        frame: g1_robot/map
+        qw: 0.690038
+        qx: 0.0
+        qy: 0.0
+        qz: 0.723773
+        x: 1.1303
+        y: 2.5414
+        z: 0.0
+      office3:
+        frame: g1_robot/map
+        qw: 0.658983
+        qx: 0.0
+        qy: 0.0
+        qz: 0.752158
+        x: 0.6421
+        y: 8.1906
+        z: 0.0
+      office4:
+        frame: g1_robot/map
+        qw: 0.718853
+        qx: 0.0
+        qy: 0.0
+        qz: -0.695162
+        x: 0.7898
+        y: 3.4108
+        z: 0.0
+      office5:
+        frame: g1_robot/map
+        qw: 0.751312
+        qx: 0.0
+        qy: 0.0
+        qz: -0.659947
+        x: 1.4352
+        y: 1.1496
+        z: 0.0
+      turn:
+        frame: g1_robot/map
+        qw: 0.766512
+        qx: 0.0
+        qy: 0.0
+        qz: -0.642229
+        x: 0.7141
+        y: 7.2378
+        z: 0.0

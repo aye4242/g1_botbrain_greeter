@@ -554,7 +554,7 @@ docker compose logs -f localization | \
   grep -E "Registered cloud|Planar base TF|Map/odom height|Map/odom roll/pitch|ICP 4.00 Hz|Global initialization|Prepared .*FPFH|Global candidate|LocalizationInitialize|localization initialization succeeded|Localization ready|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history|Holding"
 ```
 
-场景选择器会检查三地图文件、清除旧 localization publisher、等待 FAST-LIO 连续时序健康，并运行与 Navigation 相同的 preflight。随后它只读取当前 localization 容器本次启动的日志，要求连续 3 次 `accepted=true`、`fitness>0.50`、`rmse<=0.30`，最后确认 `/Odometry_loc`、两个注册点云和 `/scan` 都只有一个 publisher。`--ready-timeout 300` 是上述就绪检查共用的总时限；任何非零返回都表示当前场景不能启动 Navigation。
+场景选择器会检查三地图文件、清除旧 localization publisher、等待 FAST-LIO 连续时序健康，并实时显示当前 localization 容器本次启动后的匹配决策。它先检查 scan/Unitree twist/TF，再要求连续 3 次 `accepted=true`、`fitness>0.50`、`rmse<=0.30`，然后复查 preflight 和关键话题 publisher。`--ready-timeout 300` 是上述就绪检查共用的总时限；任何非零返回都表示当前场景不能启动 Navigation，脚本会尝试恢复切换前的场景和容器状态。
 
 先确认定位节点已加载新参数：
 
@@ -938,6 +938,7 @@ docker compose --profile navigation up -d --force-recreate navigation
 # 必须看到 FAST-LIO timing 连续稳定、实时输出可用；脚本不会重建正在运行的 Foxglove。
 # FAST-LIO is healthy: IMU initialized, timing stable, outputs live
 # Scene '<scene>' loaded. Foxglove connection was preserved.
+# Localization ICP is stable:（随后打印 3 行 fitness/rmse）
 # Scene '<scene>' localization is ready for navigation.
 
 # 脚本跳过固定启动延迟，并等待场景文件、scan、twist odom、ready、
@@ -972,7 +973,9 @@ docker compose logs --tail 160 fast_lio | \
 
 禁止只调用 `map_server/load_map` 来切层。该服务只会更换 2D YAML/PGM，Open3D 定位仍会使用启动时加载的旧楼层 PCD，形成危险的 2D/3D 混图。
 
-当前 `bot_navigation/nav_waypoints.yaml` 仍由所有楼层共享，场景选择器只切换 PCD/YAML/PGM，不会自动筛选 waypoint。在实现按场景自动分文件和硬校验前，点位名称必须带楼层前缀，例如 `ug_home`、`floor4_office`；切层后不得调用上一楼层的点位。
+`bot_navigation/nav_waypoints.yaml` 在一个文件内按 `scene` 分区保存点位。场景选择器确认 PCD/YAML/PGM 已实际加载后，会原子更新 `/botbrain_ws/.runtime/map_scene`；点位记录、查看、删除和导航命令会自动使用该场景分区，无需改变原有命令。导航器发送目标前还会核对 `/map_server` 实际加载的 YAML 场景；两者不一致或目标明显落在占用栅格上时直接拒绝发送。点名仍可保留 `ug_`/`floor4_` 前缀便于人工识别，但不再依赖前缀保证安全。
+
+首次部署时如果现场文件仍是旧的顶层 `waypoints:` 格式，命令会先按已选场景解读；在导航器核对实际 map_server 场景成功后，或执行一次记录/删除时，会原子转换为新分区格式并打印 `Migrated legacy waypoints...`。
 
 这套机制支持“每层独立导航 + 机器人停稳后切换场景”，不表示 Nav2 能跨 11 层生成一条连续路径，也不会自动识别机器人所在楼层。真正的跨层任务必须由上层状态机拆分为：当前层导航到电梯点 -> 执行乘梯动作 -> 到目标层后重建 FAST-LIO/定位 -> 使用目标层 waypoint 继续导航。
 
@@ -1021,17 +1024,33 @@ docker compose run --rm localization bash -lc '
 
 ### 5.1 日常冷启动定位与导航
 
-日常开机和楼层切换不需要重新编译。只有代码、launch 或安装型配置有更新时才执行本节后面的“代码更新与重编译”。本轮相关包需要联合部署时使用下面命令；已经成功编译过则直接从基础服务启动开始：
+日常开机和楼层切换不需要重新编译。只有代码、launch 或安装型配置有更新时才执行本节后面的“代码更新与重编译”。
+
+首次把本轮代码同步到机器人前，必须在 `git pull`/`scp`/`rsync` 覆盖 `src/` **之前**先备份现场点位：
+
+```bash
+cd /data/unitree/botbrain_ws
+waypoint_file=/data/unitree/botbrain_ws/botbrain_ws/src/bot_navigation/nav_waypoints.yaml
+if [ -f "$waypoint_file" ]; then
+  waypoint_backup="${waypoint_file}.bak.$(date +%Y%m%d_%H%M%S)"
+  cp -a "$waypoint_file" "$waypoint_backup"
+  echo "Waypoint backup: $waypoint_backup"
+fi
+```
+
+同步完源码后，本轮相关包联合编译如下；已经成功编译过则直接从基础服务启动开始：
 
 ```bash
 cd /data/unitree/botbrain_ws
 docker compose run --rm builder_base bash -lc '
   source /opt/ros/humble/setup.bash
   cd /botbrain_ws
-  colcon build --packages-select fast_lio open3d_loc g1_pkg bot_navigation bot_state_machine \
+  colcon build --packages-select fast_lio open3d_loc g1_pkg bot_navigation bot_bringup bot_state_machine \
     --cmake-args -DOpen3D_DIR=/opt/open3d/lib/cmake/Open3D
 '
 ```
+
+不要用仓库默认的 `nav_waypoints.yaml` 覆盖机器人现场文件。旧版顶层 `waypoints:` 文件不需要手工重写，但第一次迁移前必须先用 `select_map_scene.sh` 选中这批旧点位实际所属的场景；否则会把全部旧点位绑定到错误楼层。详细迁移行为见 5.3。
 
 机器人日常冷启动：
 
@@ -1040,8 +1059,8 @@ cd /data/unitree/botbrain_ws
 scene=ug  # 改为机器人当前所在楼层，例如 floor4、aitech
 
 # 终端 1：基础服务。rm 很重要：它会清除旧容器残留的 restart: always 策略。
-docker compose stop state_machine navigation localization
-docker compose rm -f state_machine navigation localization
+docker compose stop bringup state_machine navigation localization
+docker compose rm -f bringup state_machine navigation localization
 docker compose up -d bringup state_machine foxglove
 
 # 终端 2：自动重建 FAST-LIO/localization，确认目标场景和全部导航输入；
@@ -1124,9 +1143,9 @@ preflight 同时硬性检查五项输入，任一项不满足都不会启动 Nav
 | 日志字段 | 必须满足 | 失败时先查 |
 |---|---|---|
 | `scan` | `/scan` 接收时间和消息时间戳都在 1s 内 | FAST-LIO body 点云、pointcloud_to_laserscan 和 TF |
-| `twist_odom` | 必须有 0.5s 内的新鲜 `/g1_robot/odom`，正常放行日志必须为 `twist_source=unitree` | 查 `/g1_robot/robot_read_node` 是否 active、`/lf/odommodestate` 输入、`/g1_robot/odom` 的 frame/频率/时间戳；`fast_lio_pose` 只保留为显式诊断选项，不用于正式导航 |
+| `twist_odom` | 必须有 0.5s 内的新鲜 `/g1_robot/nav_odom`，正常放行日志必须为 `twist_source=unitree` | 先查 `/g1_robot/nav_odom`，再沿上游查 `/g1_robot/robot_read_node`、`/lf/odommodestate` 和 `/g1_robot/odom`；高协方差零速度不会被当成正常输入 |
 | `ready` | transient-local `/localization_ready=true` | FPFH/RANSAC 全局初始化或手工回退是否真正成功 |
-| `confidence` | 新鲜度 1s 内且 `>=0.55` | ICP fitness/RMSE、时间戳和 PCD 质量 |
+| `confidence` | 新鲜度 1s 内且 `>0.50` | ICP fitness/RMSE、时间戳和 PCD 质量 |
 | `tf` | `map -> g1_robot/base_footprint` 存在，Z 与 roll/pitch 为合理平面值 | `map -> odom -> base_footprint` TF 链 |
 
 如果出现 `Navigation preflight timed out after 300.0 s`，容器会退出且 Nav2 不会启动。定位或 `/scan` 修复后需要再显式执行 `docker compose --profile navigation up -d --force-recreate navigation`；不应改短检查或让容器无限自动重启。
@@ -1164,13 +1183,16 @@ ros2 run bot_navigation waypoint_recorder.py list               # 查看点位
 ros2 run bot_navigation waypoint_recorder.py delete ug_office   # 删除点位
 ros2 run bot_navigation waypoint_navigator.py ug_office         # 单点导航
 ros2 run bot_navigation waypoint_navigator.py ug_kitchen ug_office ug_home --loop
-ros2 run bot_navigation localization_monitor.py --ros-args \
-  -p auto_cancel:=true                                       # 连续低置信度时取消导航
+# localization_monitor 已随 Navigation 自动启动，不要再手工启动第二份
+docker compose logs -f navigation | \
+  grep --line-buffered -E "localization_monitor|safety stop|cancel"
 ```
 
 > 点位文件：`/data/unitree/botbrain_ws/botbrain_ws/src/bot_navigation/nav_waypoints.yaml`
 >
-> 当前该文件由所有楼层共享，场景选择器不会自动切换或过滤点位。点名必须包含场景前缀；例如切到 `floor4` 后只记录、调用 `floor4_*`，不得调用 `ug_*`。
+> 该文件内部按场景分区。执行 `select_map_scene.sh` 切图成功后，命令会自动仅读写当前场景；仍然可以使用 `ug_*`/`floor4_*` 前缀方便现场识别，但不是硬性要求。如果场景运行时标记与 map_server 实际 YAML 不一致，导航器会拒绝发送目标，不会静默使用错层点位。
+>
+> 首次部署前先按 5.1 备份现场文件。如果旧文件是顶层 `waypoints:` 格式，先切到这些点位所属场景，再执行 `list` 确认名称和坐标。第一次通过场景校验的导航，或第一次 `record`/`delete`，会将它原子转为 `scenes.<scene>.waypoints` 并输出 `Migrated legacy waypoints...`。`list` 本身只预览，不改写文件。
 >
 > 点位只保存平面 `x/y/yaw`：`z=0`、`qx=qy=0`。`waypoint_navigator` 不再在到点后把目标坐标硬发为 `/initialpose`；`localization_monitor` 也不再存在 `auto_anchor` 参数，不会把当前定位输出反馈为初始位姿。启动绝对位置由 FPFH/RANSAC 求解，人工 `/initialpose` 只是失败回退。
 
@@ -1241,7 +1263,9 @@ docker compose logs --tail 250 bringup fast_lio localization navigation | \
 
 判断前先单独显示 `/map`：如果关掉两个 costmap 和点云后黑点仍在，该行人/噪点已写入 PGM，动态 clearing 不可能修改静态地图文件，必须用 Map Editor 擦除。清空 costmap service 只用于诊断运行时动态层，不能代替正常射线清理。
 
-global inflation 当前保留 `inflation_radius=0.35m`，因为机器人加 padding 后的外接半径约为 `0.34m`；继续缩小会削弱 footprint 碰撞保护。`cost_scaling_factor=15.0` 使软代价更快衰减，用于缩窄视觉上的膨胀带，不应根据 Foxglove 叠加颜色再随意改小安全半径。
+global/local footprint 的几何尺寸为 `0.35m x 0.45m`。global 不额外 padding，外接半径约 `0.285m`，配合 `inflation_radius=0.29m`、`cost_scaling_factor=60.0`；local 仍保留 `padding=0.02m`、`inflation_radius=0.35m/10.0` 做实时碰撞保护。global 的高 scaling 只缩窄软代价带，不能把 inflation 半径降到全局 footprint 外接半径以下。
+
+SmacPlanner2D 的 `use_final_approach_orientation=true` 会让最终路径朝向采用进近方向，配合 `yaw_goal_tolerance=0.50rad`，避免 XY 已经到达却因记录点位的旧 yaw 卡在终点附近。
 
 local costmap 的配置是 `g1_robot/odom` 坐标系下 `8m x 8m` 的 `rolling_window=true`，正常时机器人应在窗口中心。Foxglove 列表中该图层是灰色且眼睛带删除线时，表示图层实际被隐藏，不能用该截图判断未居中。先打开 `/g1_robot/local_costmap/costmap`，再用同一 costmap 时间戳的 TF 做数值验证：
 
@@ -1257,7 +1281,7 @@ docker exec -it g1_robot_navigation bash -lc '
 
 ### 5.7 `/g1_robot/nav_odom` 与里程计偏移检查
 
-原 `/g1_robot/odom` 消息的 pose/yaw 来自 Unitree，而 `odom -> base_footprint` TF 来自 FAST-LIO，两者不是同一个位姿状态。导航现在统一使用 `/g1_robot/nav_odom`：平面 `x/y/yaw` 取自 `/Odometry_loc` 并与 TF 一致，twist 必须取自新鲜 `/g1_robot/odom`。连续 FAST-LIO 位姿差分仍保留为显式诊断代码，但默认关闭，不能作为正式导航速度闭环。检查：
+原 `/g1_robot/odom` 消息的 pose/yaw 来自 Unitree，而 `odom -> base_footprint` TF 来自 FAST-LIO，两者不是同一个位姿状态。Unitree `SportModeState.velocity` 是 odom/world-frame 速度，`g1_read.py` 会先按 yaw 转为 `base_footprint` 速度，再写入 ROS Odometry twist。导航统一使用 `/g1_robot/nav_odom`：平面 `x/y/yaw` 取自 `/Odometry_loc` 并与 TF 一致，twist 必须取自新鲜 `/g1_robot/odom`。连续 FAST-LIO 位姿差分仍保留为显式诊断代码，但默认关闭，不能作为正式导航速度闭环。检查：
 
 ```bash
 docker exec -it g1_robot_navigation bash -lc '
@@ -1266,6 +1290,7 @@ docker exec -it g1_robot_navigation bash -lc '
   ros2 topic info -v /g1_robot/nav_odom
   timeout 5 ros2 topic hz /g1_robot/nav_odom || true
   timeout 5 ros2 topic echo --once /g1_robot/nav_odom --field header || true
+  timeout 8 ros2 topic echo /g1_robot/nav_odom --field twist.twist || true
   timeout 3 ros2 run tf2_ros tf2_echo g1_robot/odom g1_robot/base_footprint || true
 '
 
@@ -1276,11 +1301,15 @@ docker exec -it g1_robot_bringup bash -lc '
   timeout 5 ros2 topic hz /g1_robot/odom || true
 '
 
-docker compose logs --tail 120 navigation | \
+docker compose logs --tail 120 localization | \
   grep -E "Nav odom relay|coherent planar nav odometry|fresh Unitree planar twist|deriving planar twist|No valid odometry twist source|Unitree odometry twist.*stale"
 ```
 
 `/g1_robot/nav_odom` 应只有一个 `nav_odom_relay` publisher，帧为 `g1_robot/odom -> g1_robot/base_footprint` 且频率稳定。正式导航只接受 `twist_source=unitree`。若为 `none`，先修复 `robot_read_node` 或 `/g1_robot/odom` 断流；`fast_lio_pose` 只有显式打开诊断参数时才可能出现，不得据此放行导航。不再用 `/g1_robot/odom` 的 pose 判断导航 TF 是否正确，也不得把任何相对 odom 话题转发为 `/initialpose`。
+
+速度坐标系必须做一次真机验收：让机器人朝相对开机方向约 90 度，低速只向自身正前方直行。正常时 `twist.linear.x` 为正，`twist.linear.y` 应接近 0。默认 `UNITREE_VELOCITY_FRAME=odom` 符合 Unitree 官方定义；只有实测确认该固件发布的已经是 body-frame 速度时，才在项目 `.env` 设置 `UNITREE_VELOCITY_FRAME=body` 并强制重建 `bringup`，随后重新执行场景选择器。未完成该检查前不要做长距离自主导航。
+
+Navigation 会自动启动 `localization_monitor`。运行中若 `/scan` 超过 1.5 秒未更新，或 `/g1_robot/nav_odom` 断流、超时、变成高协方差零速度，监控节点会立即通过 `cmd_vel_nav_safety` 压住导航速度；数据恢复后释放安全零速并继续原目标，不因短暂断流取消目标。定位 confidence 话题断流或持续低于门限也执行相同保护；单次 ICP reject/skip 不会触发取消。若安全零速长期存在，先查 `docker compose logs navigation localization`，不要重复下发点位。
 
 ### 代码更新与重编译
 
@@ -1320,7 +1349,7 @@ docker compose stop fast_lio && docker compose up -d fast_lio
 
 #### 只编译特定包（改动少时更快）
 
-> `builder_base` 已包含 `fast_lio` 和 `g1_pkg`，下面命令仅编译这两个包，速度更快。
+> `builder_base` 已包含 `fast_lio` 和 `g1_pkg`，下面命令仅适用于只改这两个包的情况。涉及本轮定位/导航/速度反馈修改时必须使用 5.1 的联合编译命令。
 
 ```bash
 cd /data/unitree/botbrain_ws
@@ -1340,8 +1369,8 @@ docker compose stop fast_lio && docker compose up -d fast_lio
 | 服务名 | 主要源码包 | 编译命令 | 重启命令 |
 |---|---|---|---|
 | `fast_lio` | `fast_lio`, `g1_pkg` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select fast_lio g1_pkg"` | `docker compose stop fast_lio && docker compose up -d fast_lio` |
-| `localization` | `open3d_loc`, `g1_pkg` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select open3d_loc g1_pkg --cmake-args -DOpen3D_DIR=/opt/open3d/lib/cmake/Open3D"` | `scene=floor4; bash tools/nav/select_map_scene.sh "$scene" --wait-ready --ready-timeout 300 && docker compose --profile navigation up -d --force-recreate navigation`（将 `floor4` 换成当前场景；FAST-LIO 不健康时增加 `--restart-fast-lio`） |
-| `navigation` | `bot_navigation`, `g1_pkg` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select bot_navigation g1_pkg"` | `docker compose stop navigation && docker compose --profile navigation up -d --force-recreate navigation` |
+| `localization` | `open3d_loc`, `g1_pkg`, `bot_navigation` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select open3d_loc g1_pkg bot_navigation --cmake-args -DOpen3D_DIR=/opt/open3d/lib/cmake/Open3D"` | `scene=floor4; bash tools/nav/select_map_scene.sh "$scene" --wait-ready --ready-timeout 300 && docker compose --profile navigation up -d --force-recreate navigation`（将 `floor4` 换成当前场景；FAST-LIO 不健康时增加 `--restart-fast-lio`） |
+| `navigation` | `bot_navigation`, `g1_pkg`, `bot_bringup` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select bot_navigation g1_pkg bot_bringup"` | `docker compose stop bringup navigation && docker compose up -d bringup && docker compose --profile navigation up -d --force-recreate navigation` |
 | `bringup` | `bot_bringup`, `g1_pkg` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select bot_bringup g1_pkg"` | `docker compose stop bringup && docker compose up -d bringup` |
 | `state_machine` | `bot_state_machine` | `docker compose run --rm builder_base bash -c "source /opt/ros/humble/setup.bash && cd /botbrain_ws && colcon build --packages-select bot_state_machine"` | `docker compose stop state_machine && docker compose up -d state_machine` |
 | `yolo` | `bot_yolo` | `docker compose up builder_yolo` | `docker compose restart yolo` |
