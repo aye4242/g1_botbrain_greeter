@@ -227,7 +227,7 @@ docker compose logs --tail 120 navigation | \
 `/g1_robot/nav_odom` 应只有一个 relay publisher。如果 Unitree twist 超时，relay 会发布零速并输出 stale 告警，应先修复 odom 断流再导航。
 
 ### `/map` 不显示
-1. 确认 `localization` 服务在运行：`docker compose up fast_lio localization`
+1. 确认 `localization` 已用机器人所在楼层启动，例如：`MAP_SCENE=floor4 docker compose --profile navigation up -d --force-recreate localization`
 2. 固定参考系改为 `map`
 
 ### 机器人显示在地图下方
@@ -254,23 +254,54 @@ docker exec -it g1_robot_localization bash -lc '
 
 ### 定位启动后直接报地图场景不匹配
 
-导航使用的 PCD、YAML 和 PGM 必须来自同一次建图。推荐的解析后真实文件名是 `<scene>_scans.pcd`、`<scene>.yaml`、`<scene>.pgm`，YAML 的 `image` 必须指向该 PGM。启动代码会硬性校验符号链接的最终目标，不一致时 localization 将直接退出，不会带着错地图进入 Foxglove/Nav2。
+导航使用的 PCD、YAML 和 PGM 必须来自同一次建图，标准命名是 `<scene>_scans.pcd`、`<scene>.yaml`、`<scene>.pgm`，YAML 的 `image` 必须指向该 PGM。定位服务通过唯一变量 `MAP_SCENE` 直接选择整套地图，不再依赖 `scans.pcd`、`accumulated.yaml` 软链接。启动代码会硬性校验三文件，不一致时 localization 将直接退出，不会带着错地图进入 Foxglove/Nav2。
 
 ```bash
-cd /data/unitree/botbrain_ws/botbrain_ws/src/g1_pkg/maps
-pcd=$(readlink -f scans.pcd)
-yaml=$(readlink -f accumulated.yaml)
+cd /data/unitree/botbrain_ws
+export MAP_SCENE=floor4  # 或 ug、floor1 等实际场景名
+maps=botbrain_ws/src/g1_pkg/maps
+
+pcd="$maps/${MAP_SCENE}_scans.pcd"
+yaml="$maps/${MAP_SCENE}.yaml"
+pgm="$maps/${MAP_SCENE}.pgm"
+test -s "$pcd" && test -s "$yaml" && test -s "$pgm"
 image=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$yaml" | head -n 1)
 image=${image#\"}; image=${image%\"}; image=${image#\'}; image=${image%\'}
 case "$image" in
-  /*) pgm=$(readlink -f "$image") ;;
-  *)  pgm=$(readlink -f "$(dirname "$yaml")/$image") ;;
+  /*) image_path=$image ;;
+  *)  image_path="$(dirname "$yaml")/$image" ;;
 esac
-printf 'PCD : %s\nYAML: %s\nPGM : %s\n' "$pcd" "$yaml" "$pgm"
-test -s "$pcd" && test -s "$yaml" && test -s "$pgm"
+test "$(realpath -e "$image_path")" = "$(realpath -e "$pgm")"
+
+# 到达目标楼层、机器人停稳并取消活动目标后，先确认 source/install
+# 的 mid360.yaml 均为 pcd_save_en: false，再重建 FAST-LIO 高度基准
+docker compose stop navigation localization fast_lio
+docker compose rm -f localization fast_lio
+docker compose up -d --force-recreate fast_lio
+docker compose logs -f fast_lio | \
+  grep -E "IMU Initial Done|FAST_LIO_TIMING|FAST_LIO_GUARD"
+
+# 看到 IMU Initial Done 且点云稳定后 Ctrl+C，再用新场景重建 localization
+docker compose --profile navigation up -d --force-recreate localization
+
+# 查看容器要求的场景
+docker inspect g1_robot_localization \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^MAP_SCENE='
+
+# 等待 launch 选择结果、ready 和 accepted 后 Ctrl+C
+docker compose logs -f localization | \
+  grep -E "Map selection:|Global localization initialization succeeded|Localization ready|ICP: accepted|ERROR|FATAL"
+
+# 再查看节点最终加载的文件
+docker exec -it g1_robot_localization bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /botbrain_ws/install/setup.bash
+  ros2 param get /global_localization_node path_map
+  ros2 param get /map_server yaml_filename
+'
 ```
 
-例如输出为 `floor1_scans.pcd / floor1.yaml / floor1.pgm` 才是同一场景。仅兼容旧命名组合 `scans.pcd / accumulated.yaml / accumulated.pgm`。更完整的场景名断言命令见 `机器人项目run.md` 的 **2.3 使用成品地图做 Open3D ICP 验收**。
+等待日志出现 `Global localization initialization succeeded`、`Localization ready`，并完成 ICP/TF 验收后，才执行 `docker compose --profile navigation up -d --force-recreate navigation`。跨楼层必须重建 FAST-LIO，使 `camera_init` 在当前层重新建立；不要通过解锁定位 Z 约束来保留跨层 odom。`docker compose restart localization` 不会切图；`MAP_SCENE` 未设置时默认回到 `ug`。禁止仅调用 `map_server/load_map`，因为它不会同步更换 Open3D PCD。更完整的首次启动、持久化选择、waypoint 楼层边界和高级显式路径覆盖见 `机器人项目run.md` 的 **四、多楼层建图与切换**。
 
 ---
 
