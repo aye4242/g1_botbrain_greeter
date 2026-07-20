@@ -184,12 +184,6 @@ ros2 launch g1_manipulation_pkg manipulation_launcher.launch.py interface:=enP8p
 cd /data/unitree/botbrain_ws
 docker compose stop navigation localization fast_lio
 
-if docker compose ps --services --filter status=running | \
-     grep -Eq '^(localization|navigation)$'; then
-  echo "ERROR: 建图时 localization/navigation 必须停止"
-  exit 1
-fi
-
 # 可选：建图前备份当前活动地图
 stamp=$(date +%Y%m%d_%H%M%S)
 cp -a botbrain_ws/src/g1_pkg/maps \
@@ -264,21 +258,6 @@ docker compose logs -f fast_lio | \
   grep -E "IMU Initial|FAST-LIO input|FAST_LIO_PCD|FAST_LIO_TIMING|FAST_LIO_GUARD"
 ```
 
-另开终端逐项检查，每条 `hz` 命令观察后按 `Ctrl+C`：
-
-```bash
-docker exec -it g1_robot_fast_lio bash
-source /opt/ros/humble/setup.bash
-source /botbrain_ws/install/setup.bash
-ros2 topic hz /livox/imu
-ros2 topic info -v /livox/imu
-ros2 topic hz /cloud_registered_1
-ros2 topic hz /Odometry_loc
-ros2 topic info -v /cloud_registered_1
-ros2 topic info -v /Odometry_loc
-exit
-```
-
 必须满足：
 
 - 启动日志包含 `imu=/livox/imu flip_yz=true imu_q=2000 lidar_q=100 guard=true`。
@@ -300,18 +279,6 @@ Foxglove/RViz2 设置：
 - `/cloud_registered_body_1` 随机器人运动是正常定义，不能用它判断世界地图是否漂移。
 - 建图时只叠加 `/cloud_registered_1` 和 `/accumulated_grid`；关闭 `/Laser_map_1`、`/pcd_map`、`/scan`、`/scan2map`、`/submap` 以及 local/global costmap 图层。
 
-`/Laser_map_1` 已在配置中关闭。旧实现每秒追加当前扫描并重新序列化全部历史点，消息会无限增大，而且独立定时器可能显示 guard 已拒绝的帧；它不参与当前 PCD 保存或栅格生成。
-
-先做以下小范围测试：
-
-1. `IMU Initial Done` 后继续静止约 30 秒。
-2. 慢速左转 20～30 度，停 3 秒，再前进约 1 米。
-3. 慢速右转 20～30 度，停 3 秒，再前进约 1 米。
-4. 慢速完成一次 90 度转弯，确认墙体仍固定在 `camera_init` 中。
-5. 若 rejected 后无法自行恢复，不要继续正式建图，先保存 timing/guard 日志排查。
-
-正式建图建议线速度不超过 `0.3 m/s`、角速度不超过 `0.2 rad/s`。门框、拐角和未来 waypoint 区域尽量从两个方向采集，并在关键位置停留 3～5 秒。当前 FAST-LIO 没有全局回环，返回起点只能检查误差，不能自动修改已经写入的历史地图。
-
 ### 步骤 4：先保存 2D 栅格，再主动保存 PCD，最后停止 FAST-LIO
 
 保存 2D 栅格快照：
@@ -322,8 +289,6 @@ source /opt/ros/humble/setup.bash
 source /botbrain_ws/install/setup.bash
 
 # 先停止机器人并等待最后一帧 2 Hz 栅格发布完成。
-sleep 1
-ros2 topic info /accumulated_grid
 ros2 run nav2_map_server map_saver_cli \
   -t /accumulated_grid --free 0.196 --occ 0.65 \
   -f /botbrain_ws/src/g1_pkg/maps/floor1
@@ -405,10 +370,6 @@ sed -n '1,10p' "$maps/floor1.yaml"
 cd /data/unitree/botbrain_ws
 maps=botbrain_ws/src/g1_pkg/maps
 
-test ! -e "$maps/floor1_scans_raw.pcd" || {
-  echo "floor1_scans_raw.pcd 已存在，请先确认该地图是否已经校正"
-  exit 1
-}
 cp -a "$maps/floor1_scans.pcd" "$maps/floor1_scans_raw.pcd"
 
 docker compose run --rm builder_base bash -lc '
@@ -826,7 +787,7 @@ floor4.yaml
 
 ```bash
 cd /data/unitree/botbrain_ws
-export MAP_SCENE=floor4
+scene=floor4
 
 # 导航模式严禁保存 PCD；source 和 install 都必须已恢复为 false
 for cfg in \
@@ -846,8 +807,7 @@ if docker compose ps --services --filter status=running | grep -qx fast_lio; the
   }
 fi
 
-# 先执行 2.3 的三文件检查，把 scene 设为当前 MAP_SCENE
-scene="$MAP_SCENE"
+# 先执行 2.3 的三文件检查
 maps=botbrain_ws/src/g1_pkg/maps
 pcd="$maps/${scene}_scans.pcd"
 yaml="$maps/${scene}.yaml"
@@ -865,34 +825,13 @@ test "$(realpath -e "$image_path")" = "$(realpath -e "$pgm")" || {
   echo "ERROR: $yaml 的 image=$image，不是 ${scene}.pgm"; exit 1;
 }
 
-# 机器人必须已到达目标楼层、停稳且没有活动导航目标，禁止运动中热切图。
-# 若当前仍有目标，先调用 /g1_robot/cancel_nav2_goal 并确认机器人停稳。
-docker compose stop navigation localization fast_lio
-docker compose rm -f localization fast_lio
-
-# 跨层后必须重置 FAST-LIO 的 camera_init/odom 高度基准
-docker compose up -d --force-recreate fast_lio
-docker compose logs -f fast_lio | \
-  grep -E "IMU Initial Done|FAST_LIO_TIMING|FAST_LIO_GUARD"
-
-# 看到 IMU Initial Done 且 timing/点云稳定后 Ctrl+C，再确认两路数据持续发布
-docker exec -it g1_robot_fast_lio bash -lc '
-  source /opt/ros/humble/setup.bash
-  source /botbrain_ws/install/setup.bash
-  timeout 5 ros2 topic hz /Odometry_loc || true
-  timeout 5 ros2 topic hz /cloud_registered_1 || true
-'
-
-# --force-recreate 很重要：restart 不会用新场景重建容器命令
-docker compose --profile navigation up -d --force-recreate localization
-
-# 查看容器创建时实际固化的场景
-docker inspect g1_robot_localization \
-  --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^MAP_SCENE='
+# 机器人必须已到达目标楼层、停稳且没有活动导航目标。
+# 一条命令会停止旧导航/定位，重建 FAST-LIO 高度基准，等待 IMU，再加载并验证目标场景。
+bash tools/nav/select_map_scene.sh "$scene" --restart-fast-lio
 
 # localization 先 sleep 30s；等待场景文件、ready 和 accepted 均通过后 Ctrl+C
 docker compose logs -f localization | \
-  grep -E "Map selection:|Global localization initialization succeeded|Localization ready|ICP: accepted|ERROR|FATAL"
+  grep --line-buffered -E "Map selection:|Global registration|Global candidate|Localization ready|ICP: accepted|ERROR|FATAL"
 
 # 再确认节点最终加载的两个入口文件
 docker exec -it g1_robot_localization bash -lc '
@@ -906,7 +845,7 @@ docker exec -it g1_robot_localization bash -lc '
 docker compose --profile navigation up -d --force-recreate navigation
 ```
 
-Shell 和项目 `.env` 都没有设置 `MAP_SCENE` 时默认使用 `ug`。上面的 `export` 只对当前终端有效；换终端或机器人重启后应再次设置。若希望机器人项目长期固定某层，可在 `/data/unitree/botbrain_ws/.env` 中新增或更新唯一一条当前选择，例如 `MAP_SCENE=floor4`，同时保留该文件中的其他变量。之后 Compose 会自动读取它。无论采用哪种方式，凡是执行包含 `localization` 的 `docker compose up`，都必须保证 `MAP_SCENE` 仍是目标楼层，否则默认值可能把容器重新创建为 `ug`。
+localization 未指定 `MAP_SCENE` 时默认使用 `ug`。需要切换场景时使用 `bash tools/nav/select_map_scene.sh <scene>`：它在同一条 Compose 命令中显式传入场景，并验证容器环境与实际加载路径，避免明确切图时仍复用旧 UG 容器。若希望项目长期固定某层，仍可在 `/data/unitree/botbrain_ws/.env` 中设置 `MAP_SCENE=floor4`。
 
 `docker compose restart localization` 只重启旧容器，不会切换地图。跨楼层必须遵守“停止 navigation/localization/fast_lio -> 在目标层重建 FAST-LIO -> 等待 IMU/点云稳定 -> 用 `MAP_SCENE` 重建 localization -> 等待定位验收 -> 重建 navigation”的顺序。
 
@@ -942,7 +881,7 @@ docker compose run --rm localization bash -lc '
 
 ```bash
 cd /data/unitree/botbrain_ws
-export MAP_SCENE=ug  # 改为机器人当前所在楼层，例如 floor4
+scene=ug  # 改为机器人当前所在楼层，例如 floor4、aitech
 
 # 导航前确认 mid360.yaml 中 pcd_save_en: false。本次定位、MPPI、
 # waypoint 和状态机边界都有修改，必须联合 build 到 install/。
@@ -959,18 +898,11 @@ docker compose stop state_machine navigation localization
 docker compose rm -f state_machine navigation localization
 docker compose up -d bringup state_machine foxglove
 
-# 终端 2：FAST-LIO 里程计与 Open3D 定位
-docker compose stop fast_lio localization
-docker compose rm -f fast_lio localization
-docker compose up -d fast_lio
-docker compose --profile navigation up -d --force-recreate localization
+# 终端 2：脚本允许旧容器已在运行，自动重建 FAST-LIO/localization 并校验场景
+bash tools/nav/select_map_scene.sh "$scene" --restart-fast-lio
 
-# 输出必须是当前选择，例如 MAP_SCENE=ug
-docker inspect g1_robot_localization \
-  --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^MAP_SCENE='
-
-docker compose logs -f fast_lio localization | \
-  grep -E "Map selection:|IMU Initial Done|FAST_LIO_TIMING|FAST_LIO_GUARD|Planar base TF|Map/odom height|Map/odom roll/pitch|ICP 4.00 Hz|Global initialization|Prepared .*FPFH|Global candidate|LocalizationInitialize|localization initialization succeeded|Localization ready|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history"
+docker compose logs -f localization | \
+  grep --line-buffered -E "Map selection:|Planar base TF|Map/odom height|Map/odom roll/pitch|ICP 4.00 Hz|Global initialization|Prepared global FPFH|Global RANSAC|Global registration|Global candidate|LocalizationInitialize|localization initialization succeeded|Localization ready|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history|ERROR|FATAL"
 ```
 
 **初始位姿对齐：**
