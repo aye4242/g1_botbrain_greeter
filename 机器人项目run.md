@@ -282,13 +282,13 @@ ros2 topic info /accumulated_grid
 
 必须满足：
 
-- 启动日志包含 `imu=/livox/imu flip_yz=true imu_q=400 lidar_q=20 guard=true`。
+- 启动日志包含 `imu=/livox/imu flip_yz=true imu_q=400 lidar_q=20 max_imu_gap=0.0300s guard=true`。
 - 启动日志包含 `[FAST_LIO_PCD] enabled=true path=<目标 PCD> interval=-1 laser_map=false`；这里显示的是 `install/` 中实际生效的配置。
 - 看到 `IMU Initial Done` 后才能移动。
-- `[FAST_LIO_TIMING] ok=true` 应稳定出现；通常 `imu_count>=5`、`max_gap<=0.02s`、扫描末端 IMU 差不超过 `0.03s`。
+- `[FAST_LIO_TIMING] ok=true` 应稳定出现；通常 `imu_count>=5`、`max_gap<=0.03s`（由 `common.max_imu_gap` 控制）、扫描末端 IMU 差不超过 `0.03s`。
 - `/cloud_registered_1` 和 `/Odometry_loc` 必须各自只有一个 publisher；多个 FAST-LIO 实例会直接形成重影和相互冲突的 TF。
 - 偶发 guard rejected 可以接受，但坏帧不得写地图；后续应能看到 recovered 或恢复正常世界点云刷新。
-- 出现 `discarded buffered sensor data and rebased IMU propagation` 表示检测到输入断层，坏帧已在传播前丢弃并清空积压；机器人保持静止，确认后续 `ok=true` 和实时输出恢复。
+- 出现 `discarded buffered LiDAR data, preserved future IMU samples` 表示检测到输入断层：坏帧和积压 LiDAR 已在传播前丢弃，已到达的后续 IMU 会保留以便下一帧恢复。机器人保持静止，确认后续 `ok=true` 和实时输出恢复。
 - 出现 `output latched unhealthy` 后，FAST-LIO 已停止发布里程计、TF 和点云。不要继续移动或导航；建图时先保留日志并按需要保存已确认数据，然后重启 `fast_lio`。
 - 开启保存时 `[MAP] frame=100, 200...` 与 `pcl_wait_save` 应持续增长。
 
@@ -548,12 +548,13 @@ bash tools/nav/select_map_scene.sh "$scene" \
   --wait-ready \
   --ready-timeout 300
 
-# 命令返回 0 后再查看完整定位日志；日志跟随满足验收条件后按 Ctrl-C 退出。
+# 命令返回前会直接打印 3 行通过阈值的 ICP fitness/rmse。
+# 返回 0 后可继续跟随完整定位日志；按 Ctrl-C 不会停止后台容器。
 docker compose logs -f localization | \
   grep -E "Registered cloud|Planar base TF|Map/odom height|Map/odom roll/pitch|ICP 4.00 Hz|Global initialization|Prepared .*FPFH|Global candidate|LocalizationInitialize|localization initialization succeeded|Localization ready|ICP: accepted|Manual relocalization|ignoring /initialpose|Rejecting|Skipping ICP|Waiting for odometry history|Holding"
 ```
 
-场景选择器会检查三地图文件、清除旧 localization publisher、等待 FAST-LIO 连续时序健康，并运行与 Navigation 相同的 preflight。`--ready-timeout 300` 只控制自动定位和导航输入的等待阶段；任何非零返回都表示当前场景不能启动 Navigation。
+场景选择器会检查三地图文件、清除旧 localization publisher、等待 FAST-LIO 连续时序健康，并运行与 Navigation 相同的 preflight。随后它只读取当前 localization 容器本次启动的日志，要求连续 3 次 `accepted=true`、`fitness>0.50`、`rmse<=0.30`，最后确认 `/Odometry_loc`、两个注册点云和 `/scan` 都只有一个 publisher。`--ready-timeout 300` 是上述就绪检查共用的总时限；任何非零返回都表示当前场景不能启动 Navigation。
 
 先确认定位节点已加载新参数：
 
@@ -600,7 +601,7 @@ Localization ready: verified map->odom is now available
 ICP: accepted=true fitness=... rmse=... correction=... map_odom_z=1.247 map_odom_rp=0.00/0.00 deg ...
 ```
 
-如果场景选择器因自动全局初始化超时返回非零，localization 容器会继续保留以便诊断，但 Navigation 仍为停止状态。人工 `/initialpose` 成功后，直接在现有 localization 容器中重新执行 preflight；不要再次运行场景选择器，否则它会重建 localization 并丢弃刚才的人工校正：
+如果场景选择器因自动全局初始化超时返回非零，localization 容器会继续保留以便诊断，但 Navigation 仍为停止状态。人工 `/initialpose` 成功后，先在现有日志中确认连续 3 条 `ICP: accepted=true` 都满足 fitness/RMSE 门限，再在现有 localization 容器中重新执行 preflight；不要再次运行场景选择器，否则它会重建 localization 并丢弃刚才的人工校正：
 
 ```bash
 docker exec -it g1_robot_localization bash -lc '
@@ -965,7 +966,7 @@ docker compose logs --tail 160 fast_lio | \
   grep -E "FAST_LIO_TIMING|FAST_LIO_GUARD|IMU Initial Done"
 ```
 
-`discarded buffered sensor data and rebased IMU propagation` 是自动恢复日志；`output latched unhealthy` 才表示输出已被安全停止，需要取消导航并重新执行带 `--restart-fast-lio` 的切图命令。Foxglove 的 `bt_navigator_*_rclcpp_node` 参数读取错误只影响参数面板，不能解释点云和 TF 同时消失。
+`discarded buffered LiDAR data, preserved future IMU samples` 是自动恢复日志；`output latched unhealthy` 才表示输出已被安全停止，需要取消导航并重新执行带 `--restart-fast-lio` 的切图命令。Foxglove 的 `bt_navigator_*_rclcpp_node` 参数读取错误只影响参数面板，不能解释点云和 TF 同时消失。
 
 跨楼层时还必须重建 FAST-LIO。当前定位固定 `map_odom_z=1.247`，前提是 FAST-LIO 的 `camera_init` 在当前楼层重新建立；若乘电梯时让 FAST-LIO 连续运行，其 odom 会保留楼层高度差，目标层地面为 `z=0` 的 PCD 将无法可靠配准。不要通过解锁 Z 来绕过这一约束。同一楼层只替换修订后的 PGM/YAML/PCD 时，可以保留 FAST-LIO，只重建 localization。
 
@@ -1123,7 +1124,7 @@ preflight 同时硬性检查五项输入，任一项不满足都不会启动 Nav
 | 日志字段 | 必须满足 | 失败时先查 |
 |---|---|---|
 | `scan` | `/scan` 接收时间和消息时间戳都在 1s 内 | FAST-LIO body 点云、pointcloud_to_laserscan 和 TF |
-| `twist_odom` | 优先使用 0.5s 内的新鲜 `/g1_robot/odom`；若其不可用，允许由连续 `/Odometry_loc` 位姿导出有限平面速度 | 查看日志中的 `twist_source=unitree`、`fast_lio_pose` 或 `none`，再查对应输入、frame 和时间戳 |
+| `twist_odom` | 必须有 0.5s 内的新鲜 `/g1_robot/odom`，正常放行日志必须为 `twist_source=unitree` | 查 `/g1_robot/robot_read_node` 是否 active、`/lf/odommodestate` 输入、`/g1_robot/odom` 的 frame/频率/时间戳；`fast_lio_pose` 只保留为显式诊断选项，不用于正式导航 |
 | `ready` | transient-local `/localization_ready=true` | FPFH/RANSAC 全局初始化或手工回退是否真正成功 |
 | `confidence` | 新鲜度 1s 内且 `>=0.55` | ICP fitness/RMSE、时间戳和 PCD 质量 |
 | `tf` | `map -> g1_robot/base_footprint` 存在，Z 与 roll/pitch 为合理平面值 | `map -> odom -> base_footprint` TF 链 |
@@ -1179,7 +1180,7 @@ ros2 run bot_navigation localization_monitor.py --ros-args \
 |------|---------|---------|
 | `bringup`（雷达驱动） | 硬件握手 **5~10s** | `livox/lidar publish use livox custom format` |
 | `fast_lio` | 直接 `docker compose up fast_lio` 默认 sleep 25s；标准场景选择器设为 0 并改用健康门 | `IMU Initial Done`、连续三次 `FAST_LIO_TIMING ok=true`，且 `/Odometry_loc` 与 `/cloud_registered_1` 实际可读取 |
-| `localization` | 直接 Compose 默认 sleep 30s；标准场景选择器设为 0 并等待运行时验证 | `Global localization initialization succeeded`、`/localization_ready=true`，随后出现新鲜 `ICP: accepted=true` |
+| `localization` | 直接 Compose 默认 sleep 30s；标准场景选择器设为 0 并等待运行时验证 | `Global localization initialization succeeded`、`/localization_ready=true`，随后连续 3 次 ICP 通过 fitness/RMSE 门限 |
 | `navigation` | **sleep 30s + preflight 最多 300s** | `Navigation preflight passed`，随后 Nav2 lifecycle 全部 active |
 
 > bringup 刚起来时 fast_lio 打印 `No Effective Points!` 属正常，等雷达就绪后自动恢复。超过 30s 仍无点云再排查。
@@ -1189,8 +1190,8 @@ ros2 run bot_navigation localization_monitor.py --ros-args \
 2. ✅ fast_lio 出现 `IMU Initial Done`，且 `/Odometry_loc`、`/cloud_registered_1` 正常 → 里程计就绪
 3. ✅ localization 日志确认高度、roll/pitch 和 `Planar base TF` 三个约束均为 `enabled=true`，且 `ICP 4.00 Hz (250.0 ms), cloud_queue=1, odom_history=30, ... stamp_skew<=0.030s`
 4. ✅ 等待三个一致 FPFH/RANSAC 全局候选，确认 `Localization ready` 和 `/localization_ready=true`；只在自动初始化失败时手工回退
-5. ✅ 连续出现可信 `ICP: accepted=true`，跳变帧能被 1m/15deg 门限拒绝
-6. ✅ 启动 navigation 前确认 `/scan` 时间戳新鲜，等待 `Navigation preflight passed`
+5. ✅ 场景选择器直接打印连续 3 行可信 ICP fitness/RMSE，跳变帧能被 1m/15deg 门限拒绝
+6. ✅ 启动 navigation 前确认 `/scan` 时间戳新鲜，且 preflight 明确输出 `twist_source=unitree`
 7. ✅ Nav2 启动后确认 `/g1_robot/nav_odom` 持续发布、六个 lifecycle 节点全部 `active [3]` 且 `/g1_robot/navigate_to_pose` action 存在
 
 **启动导航必须同时保持 bringup、fast_lio、localization 正常运行。**
@@ -1256,7 +1257,7 @@ docker exec -it g1_robot_navigation bash -lc '
 
 ### 5.7 `/g1_robot/nav_odom` 与里程计偏移检查
 
-原 `/g1_robot/odom` 消息的 pose/yaw 来自 Unitree，而 `odom -> base_footprint` TF 来自 FAST-LIO，两者不是同一个位姿状态。导航现在统一使用 `/g1_robot/nav_odom`：平面 `x/y/yaw` 取自 `/Odometry_loc` 并与 TF 一致；twist 优先取新鲜 `/g1_robot/odom`，Unitree twist 不可用时由连续 `/Odometry_loc` 位姿差分回退。检查：
+原 `/g1_robot/odom` 消息的 pose/yaw 来自 Unitree，而 `odom -> base_footprint` TF 来自 FAST-LIO，两者不是同一个位姿状态。导航现在统一使用 `/g1_robot/nav_odom`：平面 `x/y/yaw` 取自 `/Odometry_loc` 并与 TF 一致，twist 必须取自新鲜 `/g1_robot/odom`。连续 FAST-LIO 位姿差分仍保留为显式诊断代码，但默认关闭，不能作为正式导航速度闭环。检查：
 
 ```bash
 docker exec -it g1_robot_navigation bash -lc '
@@ -1268,11 +1269,18 @@ docker exec -it g1_robot_navigation bash -lc '
   timeout 3 ros2 run tf2_ros tf2_echo g1_robot/odom g1_robot/base_footprint || true
 '
 
+docker exec -it g1_robot_bringup bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /botbrain_ws/install/setup.bash
+  ros2 lifecycle get /g1_robot/robot_read_node
+  timeout 5 ros2 topic hz /g1_robot/odom || true
+'
+
 docker compose logs --tail 120 navigation | \
   grep -E "Nav odom relay|coherent planar nav odometry|fresh Unitree planar twist|deriving planar twist|No valid odometry twist source|Unitree odometry twist.*stale"
 ```
 
-`/g1_robot/nav_odom` 应只有一个 `nav_odom_relay` publisher，帧为 `g1_robot/odom -> g1_robot/base_footprint` 且频率稳定。日志 `twist_source=unitree` 表示使用 Unitree 速度，`twist_source=fast_lio_pose` 表示使用 FAST-LIO 位姿差分回退；只有 `twist_source=none` 才会输出零速并提高协方差，此时不得发目标。不再用 `/g1_robot/odom` 的 pose 判断导航 TF 是否正确，也不得把任何相对 odom 话题转发为 `/initialpose`。
+`/g1_robot/nav_odom` 应只有一个 `nav_odom_relay` publisher，帧为 `g1_robot/odom -> g1_robot/base_footprint` 且频率稳定。正式导航只接受 `twist_source=unitree`。若为 `none`，先修复 `robot_read_node` 或 `/g1_robot/odom` 断流；`fast_lio_pose` 只有显式打开诊断参数时才可能出现，不得据此放行导航。不再用 `/g1_robot/odom` 的 pose 判断导航 TF 是否正确，也不得把任何相对 odom 话题转发为 `/initialpose`。
 
 ### 代码更新与重编译
 
@@ -1577,11 +1585,11 @@ guard_max_velocity_norm: 20.0
 同时每帧必须满足 timing：
 
 - IMU 数量不少于 5；
-- 最大 IMU gap 不超过 0.02 秒（包含前后 LiDAR 帧边界）；
+- 最大 IMU gap 不超过 `common.max_imu_gap`；MID360 当前为 0.03 秒（包含前后 LiDAR 帧边界）；
 - scan 时长 0.05~0.15 秒；
 - scan 末端与最后 IMU 间隔不超过 0.03 秒。
 
-历史版本曾允许 `[FAST_LIO_TIMING] ok=false` 时推进 IMU 时间线。当前实现会在 IMU propagation 前丢弃异常 scan、清理积压并重建有限时间基线；异常帧不得传播、发布或写入 ikd-tree。若重建前状态已经不安全，则直接进入 `output latched unhealthy`，必须重启 FAST-LIO。
+历史版本曾允许 `[FAST_LIO_TIMING] ok=false` 时推进 IMU 时间线。当前实现会在 IMU propagation 前丢弃异常 scan 和积压 LiDAR，保留已经到达的后续 IMU，并重建有限时间基线；异常帧不得传播、发布或写入 ikd-tree。若重建前状态已经不安全，则直接进入 `output latched unhealthy`，必须重启 FAST-LIO。
 
 ### rejected/recovery 时 Foxglove 的预期表现
 
