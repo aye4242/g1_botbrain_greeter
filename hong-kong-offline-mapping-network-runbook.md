@@ -152,8 +152,10 @@ sudo nmcli connection modify G1-MAP \
 
 执行位置：**机器人 SSH 终端**。
 
+94:ba:06:f2:63:39，192.168.100.3
+
 ```bash
-sudo nmcli device wifi rescan ifname "$WIFI_IF"
+sudo nmcli device wifi rescan ifname wlx94ba06f26339
 nmcli -t -f SSID,SIGNAL,SECURITY \
   device wifi list ifname "$WIFI_IF" --rescan yes |
   grep '^G1-MAP:'

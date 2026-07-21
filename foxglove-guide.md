@@ -1,4 +1,6 @@
-# Foxglove Studio 使用指南（botbrain G1机器人）
+# Foxglove Studio 使用指南（已弃用）
+
+> 建图、定位和导航现已统一使用本地 RViz2，不再启动 Foxglove Bridge。请使用 [rviz-guide.md](rviz-guide.md)。本文件仅保留用于查阅旧记录。
 
 ## 1. 连接方式
 
