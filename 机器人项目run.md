@@ -172,6 +172,10 @@ ros2 launch g1_manipulation_pkg manipulation_launcher.launch.py interface:=enP8p
 
 > 本文中所有“查看点云、发送初始位姿、发送导航目标”的 Foxglove 操作均已由 RViz2 替代：建图打开 `g1_mapping_rviz2.rviz`，定位/导航打开 `g1_nav_loc_rviz2.rviz`。两份预设和实际 ROS 话题一一对应，不能用空白 RViz2 窗口代替预设。
 
+> Zenoh 工作站端点格式必须写成 `tcp/<G1_IP>:7448`，不能写成 `tcp://<G1_IP>:7448`。如果出现 `Unicast not supported for tcp: protocol`，先修正端点，不要把后续的 `std::bad_alloc` 当成 RViz2 内存故障。
+
+> 如果机器人切换 Wi‑Fi 后 IP 改为 `192.168.100.3`，只需在 workstation 执行 `bash tools/host_side/mapping_rviz2.sh 192.168.100.3`（建图）或 `bash tools/host_side/g1_nav_loc_rviz2.sh 192.168.100.3`（导航）。不要修改 `enP8p1s0`、`192.168.123.x` 等 Unitree 内部控制网配置。
+
 ### RViz2 工作站连接与使用
 
 以下命令在 **workstation** 执行；`g1_ip` 改为机器人当前 IP，`project_dir` 改为本仓库在工作站上的实际目录。每次新开终端、切换机器人或 RViz 无数据时，都重新执行一遍。
@@ -182,7 +186,7 @@ g1_ip=192.168.100.30
 
 source /opt/ros/humble/setup.bash
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
-export ZENOH_CONFIG_OVERRIDE="mode=\"client\";connect/endpoints=[\"tcp://${g1_ip}:7448\"]"
+export ZENOH_CONFIG_OVERRIDE="mode=\"client\";connect/endpoints=[\"tcp/${g1_ip}:7448\"]"
 
 ros2 daemon stop >/dev/null 2>&1 || true
 ros2 daemon start >/dev/null 2>&1 || true
@@ -1182,7 +1186,7 @@ project_dir=/home/aitech/Workspace/botbrain_project
 g1_ip=192.168.100.30
 source /opt/ros/humble/setup.bash
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
-export ZENOH_CONFIG_OVERRIDE="mode=\"client\";connect/endpoints=[\"tcp://${g1_ip}:7448\"]"
+export ZENOH_CONFIG_OVERRIDE="mode=\"client\";connect/endpoints=[\"tcp/${g1_ip}:7448\"]"
 ros2 daemon stop  >/dev/null 2>&1 || true
 ros2 daemon start >/dev/null 2>&1 || true
 sleep 3

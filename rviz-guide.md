@@ -68,12 +68,35 @@ RViz2 视角操作：
 source /opt/ros/humble/setup.bash
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 g1_ip=192.168.100.30  # 改为当前 G1 IP
-export ZENOH_CONFIG_OVERRIDE="mode=\"client\";connect/endpoints=[\"tcp://${g1_ip}:7448\"]"
+export ZENOH_CONFIG_OVERRIDE="mode=\"client\";connect/endpoints=[\"tcp/${g1_ip}:7448\"]"
 ros2 daemon stop >/dev/null 2>&1 || true
 ros2 daemon start >/dev/null 2>&1 || true
 ros2 topic hz /cloud_registered_1
 ros2 topic hz /Odometry_loc
 ```
+
+注意 Zenoh 端点格式必须是 `tcp/192.168.37.204:7448`，不是 `tcp://192.168.37.204:7448`。后者会报 `Unicast not supported for tcp: protocol`，随后 RViz2 可能连带出现 `std::bad_alloc`；这不是 RViz2 内存不足。
+
+### 切换 Wi‑Fi 后更换机器人 IP
+
+如果机器人从 `192.168.37.204` 切换到 `192.168.100.3`，不需要修改 RViz 配置文件，也不需要修改机器人内部 Unitree 网口配置。直接在 workstation 执行：
+
+```bash
+# 建图
+bash tools/host_side/mapping_rviz2.sh 192.168.100.3
+
+# 定位/导航
+bash tools/host_side/g1_nav_loc_rviz2.sh 192.168.100.3
+```
+
+脚本会自动更新 Zenoh 端点、刷新 ROS 2 daemon 并打开对应 RViz2 预设。机器人端只需确认 `zenoh` 仍在运行：
+
+```bash
+cd /data/unitree/botbrain_ws
+docker compose up -d zenoh bringup state_machine
+```
+
+Zenoh 路由器监听 `0.0.0.0:7448`，所以机器人 Wi‑Fi 地址变化后通常不需要重启 Zenoh。若脚本提示无法连接，先确认 workstation 与机器人在同一网段，并执行 `ping 192.168.100.3`；机器人 `enP8p1s0` 的 `192.168.123.x` 地址是 Unitree 控制链路，不能因为 Wi‑Fi 换网而改掉。
 
 这两个话题应持续有频率；没有数据时排查 FAST-LIO，而不是调整 RViz2 视角。
 
@@ -146,3 +169,34 @@ docker compose logs --tail 30 fast_lio | grep "FAST-LIO mapping profile"
 | 点云或 scan 同时停止 | 查 FAST-LIO 日志中的 `FAST_LIO_TIMING`、`FAST_LIO_GUARD` 和 `output latched unhealthy` |
 
 现场完整命令见 [建图导航指令.md](建图导航指令.md)，完整验收、切图和故障分析见 [机器人项目run.md](机器人项目run.md)。
+
+## 7. 机器人端底层通信报错
+
+如果机器人端出现：
+
+```text
+ddsi_udp_conn_write to udp/192.168.123.161 failed
+G1Write locomotion Move failed: code=3104
+```
+
+这是 `bringup` 里的 Unitree SDK 与机器人本体控制器之间的底层链路故障，不是 RViz2 或 Zenoh 7448 故障。此时 `/Odometry_loc`、TF 和 `/scan` 可能不完整，不能继续判断建图质量。先在机器人宿主机检查：
+
+```bash
+ip -br addr
+ip route get 192.168.123.161
+ping -c 3 -W 1 192.168.123.161
+```
+
+确认机器人已开机、连接控制器的网线/网口存在，且 `botbrain_ws/robot_config.yaml` 中的 `network_interface` 与实际网卡一致。该项目当前 G1 配置使用 `enP8p1s0`；不要把工作站连接 Zenoh 的无线网卡误当成 Unitree 控制网卡。
+
+另外，启动基础服务请使用后台模式：
+
+```bash
+docker compose up -d zenoh bringup state_machine
+```
+
+不加 `-d` 只会把容器日志附着到当前终端，不是 RViz2 连接方式。若提示 `g1_robot_foxglove` 是 orphan container，只清理这个旧容器即可；不要随意使用 `--remove-orphans`，以免误删现场仍需要的相机容器：
+
+```bash
+docker rm -f g1_robot_foxglove 2>/dev/null || true
+```

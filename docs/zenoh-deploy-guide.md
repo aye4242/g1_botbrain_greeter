@@ -114,7 +114,7 @@ docker compose up -d bringup state_machine foxglove fast_lio localization
 # 每次打开 RViz2 前执行
 source /opt/ros/humble/setup.bash
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
-export ZENOH_CONFIG_OVERRIDE='mode="client";connect/endpoints=["tcp:<G1_IP>:7448"]'
+export ZENOH_CONFIG_OVERRIDE='mode="client";connect/endpoints=["tcp/<G1_IP>:7448"]'
 
 # 验证连接（Publisher count 必须 > 0）
 ros2 daemon stop  >/dev/null 2>&1 || true
