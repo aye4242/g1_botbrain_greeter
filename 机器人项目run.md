@@ -610,6 +610,8 @@ docker compose logs -f localization | \
 
 场景选择器会检查三地图文件、清除旧 localization publisher、等待 FAST-LIO 连续时序健康，并实时显示当前 localization 容器本次启动后的匹配决策。它先检查 scan/Unitree twist/TF，再要求连续 3 次 `accepted=true`、`fitness>0.50`、`rmse<=0.30`，然后复查 preflight 和关键话题 publisher。`--ready-timeout 300` 是上述就绪检查共用的总时限；任何非零返回都表示当前场景不能启动 Navigation，脚本会尝试恢复切换前的场景和容器状态。
 
+`300` 秒是最长上限，不是固定 sleep。与过去直接 `stop/rm/up -d` 相比，场景选择器返回得更慢，是因为 Compose 的 `-d` 只保证容器已启动，场景选择器还要等到实际可导航。同楼层且 FAST-LIO 已健康时去掉 `--restart-fast-lio` 可跳过 FAST-LIO 重建和 IMU 再初始化；冷启动、FAST-LIO 不健康或跨楼层不能省略该参数。不应删除 `--wait-ready` 后直接启动 Navigation。
+
 先确认定位节点已加载新参数：
 
 ```text

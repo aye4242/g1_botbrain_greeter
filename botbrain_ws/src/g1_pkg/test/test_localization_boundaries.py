@@ -190,6 +190,7 @@ def test_map_scene_selector_recreates_and_verifies_localization_container():
     assert "/g1_robot/odom" in selector
     assert "navigation topics must each have exactly 1 publisher" in selector
     assert "Navigation topic publisher check ${stable_rounds}/${required_rounds}" in selector
+    assert '[ "$stable_rounds" -gt 0 ]' in selector
     assert "readonly PUBLISHER_STABLE_ROUNDS=3" in selector
     assert "restore_previous_runtime" in selector
     assert "arm_switch_rollback" in selector
@@ -201,9 +202,12 @@ def test_map_scene_selector_recreates_and_verifies_localization_container():
     assert "timing discontinuity" in selector
     assert "timing_count" in selector
     assert "ros2 topic echo /Odometry_loc --once" in selector
-    assert "ros2 topic echo /cloud_registered_1 --once" in selector
+    assert "ros2 topic echo /cloud_registered_1" in selector
+    assert "--qos-reliability best_effort --once" in selector
     assert "docker compose ps -aq --all localization" in selector
     assert "old map publishers are still visible" in selector
+    assert '[ "$SECONDS" -lt "$old_publisher_deadline" ] ||' in selector
+    assert '[ "$old_publisher_zero_rounds" -gt 0 ]' in selector
     assert "botbrain_ws/install/fast_lio/share/fast_lio/config/mid360.yaml" in selector
     assert "pcd_save_en:" in selector
     assert 'bash tools/nav/select_map_scene.sh "$scene"' in compact_runbook
@@ -343,6 +347,10 @@ def test_rviz_presets_match_runtime_topics_and_bound_mapping_history():
     nav_cloud = nav_displays["registered cloud (FAST-LIO)"]
     assert nav_cloud["Topic"]["Depth"] == 1
     assert nav_cloud["Topic"]["Reliability Policy"] == "Best Effort"
+    body_cloud = nav_displays["body cloud (robot live scan)"]
+    assert body_cloud["Topic"]["Value"] == "/cloud_registered_body_1"
+    assert body_cloud["Topic"]["Depth"] == 1
+    assert body_cloud["Topic"]["Reliability Policy"] == "Best Effort"
     static_pcd = nav_displays["map (scans.pcd)"]
     assert static_pcd["Topic"]["Reliability Policy"] == "Reliable"
     assert static_pcd["Topic"]["Durability Policy"] == "Transient Local"
@@ -379,8 +387,22 @@ def test_workstation_rviz_launchers_are_one_command_and_ros_setup_safe():
         assert "ros2 daemon stop" in source
         assert 'exec rviz2 -d "$RVIZ_CFG"' in source
 
-    assert "bash tools/host_side/mapping_rviz2.sh 192.168.100.30" in compact
-    assert "bash tools/host_side/g1_nav_loc_rviz2.sh 192.168.100.30" in compact
+    assert "bash tools/host_side/mapping_rviz2.sh 192.168.100.3" in compact
+    assert "bash tools/host_side/g1_nav_loc_rviz2.sh 192.168.100.3" in compact
+    assert "cd ~/Workspace/g1_botbrain_greeter" in compact
+    assert (
+        'bash tools/nav/select_map_scene.sh "$scene" '
+        '--wait-ready --ready-timeout 300'
+    ) in compact
+    assert (
+        'bash tools/nav/select_map_scene.sh "$scene" '
+        '--restart-fast-lio --wait-ready --ready-timeout 300'
+    ) in compact
+    assert "只有场景选择脚本返回 0 后才执行" in compact
+    assert (
+        "docker compose --profile navigation up -d "
+        "--force-recreate navigation"
+    ) in compact
     assert "FAST_LIO_MAPPING_PROFILE=default" in compact
     assert "FAST_LIO_MAPPING_PROFILE=corridor" in compact
 
@@ -498,7 +520,7 @@ def test_open3d_localization_pairs_latest_cloud_with_matching_odom_history():
 
     assert "rclcpp::QoS(rclcpp::KeepLast(10)).reliable()" in source
     assert "rclcpp::QoS(rclcpp::KeepLast(20)).reliable()" in source
-    assert "rclcpp::QoS(rclcpp::KeepLast(1)).reliable()" in source
+    assert "rclcpp::QoS(rclcpp::KeepLast(1)).best_effort()" in source
     assert '"Odometry_loc", odom_input_qos' in source
     assert '"cloud_registered_1", latest_cloud_qos' in source
     assert "Eigen::aligned_allocator<TimedOdomPose>" in source
@@ -507,7 +529,17 @@ def test_open3d_localization_pairs_latest_cloud_with_matching_odom_history():
     assert "manual_pose_generation = manual_pose_generation_.load();" in source
     assert "manual_pose_generation_.load() == iteration_manual_pose_generation" in source
     assert "Manual pose reset detected during initialization" in source
+    assert source.count("icp_candidate_max_age_sec_ + candidate_processing_sec") == 2
+    assert "candidate_time - loc_start" in source
     assert "KeepLast(100000)" not in source
+
+
+def test_fast_lio_live_clouds_do_not_queue_stale_zenoh_frames():
+    source = _read("botbrain_ws/src/fast_lio/src/laserMapping.cpp")
+
+    assert "rclcpp::QoS(rclcpp::KeepLast(1)).best_effort()" in source
+    assert '"cloud_registered_1", latest_cloud_qos' in source
+    assert '"cloud_registered_body_1", latest_cloud_qos' in source
 
 
 def test_open3d_initializes_from_current_cloud_without_persisted_pose():
