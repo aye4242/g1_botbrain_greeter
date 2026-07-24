@@ -1407,10 +1407,10 @@ docker compose stop fast_lio && docker compose up -d fast_lio
 | 参数 | 当前值 | 含义 |
 |---|---:|---|
 | `mapping.guard_recovery_min_rejections` | 5 | 至少连续拒绝 5 个候选后才允许恢复 |
-| `mapping.guard_recovery_min_effective_ratio` | 0.15 | 当前恢复帧有效点比例门限 |
+| `mapping.guard_recovery_min_effective_ratio` | 0.05 | 当前恢复帧有效点比例门限 |
 | `mapping.guard_recovery_max_residual` | 0.10 m | 当前恢复帧 residual 门限 |
-| `mapping.guard_recovery_max_translation_correction` | 0.75 m | 当前只对恢复候选放宽的平移修正量 |
-| `mapping.guard_recovery_max_rotation_correction_deg` | 15° | 当前只对恢复候选放宽的旋转修正量 |
+| `mapping.guard_recovery_max_translation_correction` | 1.50 m | 当前只对恢复候选放宽的平移修正量 |
+| `mapping.guard_recovery_max_rotation_correction_deg` | 30° | 当前只对恢复候选放宽的旋转修正量 |
 
 满足条件时日志为：
 

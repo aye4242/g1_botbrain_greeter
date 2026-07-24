@@ -445,7 +445,13 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
 
     pub_map_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("pcd_map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable());
     pub_submap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("submap", 1);
-    pub_scan2map_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("scan2map", 1);
+    // This is a live operator preview, not durable state.  Keep only the
+    // newest frame and never let a slow/mobile-Wi-Fi RViz subscriber apply
+    // reliable backpressure to localization.
+    const auto live_cloud_qos =
+        rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+    pub_scan2map_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "scan2map", live_cloud_qos);
     pub_scan_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("scan", 1);
     pub_localization_3d_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("localization_3d", 1);
     pub_localization_3d_confidence_ = this->create_publisher<std_msgs::msg::Float32>("localization_3d_confidence", 1);
